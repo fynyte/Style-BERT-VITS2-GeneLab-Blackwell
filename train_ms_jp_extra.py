@@ -44,11 +44,29 @@ torch.backends.cudnn.allow_tf32 = (
 )
 torch.set_num_threads(1)
 torch.set_float32_matmul_precision("medium")
-torch.backends.cuda.sdp_kernel("flash")
+
+# ---------------------------------------------------------------------------
+# [FIX 1] cuDNN の conv アルゴリズム autotune を有効化する。
+#
+# 未設定 (= False) だと cuDNN はヒューリスティクスだけでアルゴリズムを選ぶ。
+# HiFi-GAN の Conv1d は「チャンネル数が小さく (16〜512)、系列長が非常に長い
+# (最終段で 16384)」という cuDNN にとって不得手な形をしており、ヒューリス
+# ティクスは sm_90 (H100/H200) / sm_100 (B200/B300) 上で頻繁に低速な
+# non-tensor-core エンジンを選ぶ。sm_75/86/89/120 系は長年チューニングされた
+# レガシーエンジンのカバレッジが広いため、この差が出にくい。
+#
+# vocoder / discriminator は rand_slice_segments の後なので入力形状が
+# segment_size 固定 = autotune が一度で収束する。前段 (text/posterior/flow) は
+# 可変長だが DistributedBucketSampler により形状の種類は限られる。
+# ---------------------------------------------------------------------------
+torch.backends.cudnn.benchmark = True
+
 torch.backends.cuda.enable_flash_sdp(True)
 torch.backends.cuda.enable_mem_efficient_sdp(
     True
 )  # Not available if torch version is lower than 2.0
+# 注: torch.backends.cuda.sdp_kernel("flash") は context manager を返すだけで
+#     `with` なしでは何の効果もない (かつ PyTorch 2.x では deprecated)。削除。
 
 config = get_config()
 global_step = 0
@@ -392,6 +410,31 @@ def run():
         )
     else:
         optim_wd = None
+    # -----------------------------------------------------------------------
+    # [FIX 4] (任意) 形状が固定な部分だけ torch.compile する。
+    #
+    # VITS の 1 ステップは数千〜1万本の細かいカーネルを発行する。カーネルが
+    # 速い GPU ほど「GPU が空回りして CPU のローンチ待ちになる」領域に入るため、
+    # H200/B200/B300 では特に効く。
+    #
+    # 前段 (text encoder / posterior encoder / flow) は系列長が可変で再コンパイル
+    # が多発するので触らない。rand_slice_segments より後の
+    #   - net_g.dec      (HiFi-GAN Generator)
+    #   - net_d          (MPD/MRD)
+    # は入力が segment_size 固定なので安全にコンパイルできる。
+    #
+    #   SBV2_COMPILE=1                   -> 有効化
+    #   SBV2_COMPILE_MODE=reduce-overhead -> CUDA Graphs でローンチ律速を潰す
+    # -----------------------------------------------------------------------
+    if os.environ.get("SBV2_COMPILE", "0") == "1":
+        _mode = os.environ.get("SBV2_COMPILE_MODE", "max-autotune-no-cudagraphs")
+        try:
+            net_g.dec = torch.compile(net_g.dec, mode=_mode, dynamic=False)
+            net_d = torch.compile(net_d, mode=_mode, dynamic=False)
+            logger.info(f"torch.compile enabled (mode={_mode}) for net_g.dec / net_d")
+        except Exception as e:
+            logger.warning(f"torch.compile failed, continuing eagerly: {e}")
+
     net_g = DDP(
         net_g,
         device_ids=[local_rank],
@@ -549,7 +592,62 @@ def run():
     else:
         scheduler_wd = None
         wl = None
-    scaler = GradScaler(enabled=hps.train.bf16_run)
+    # -----------------------------------------------------------------------
+    # [FIX 3] Tensor Core を使わせる / 使えていない場合に警告する。
+    #
+    # fp16_run も bf16_run も False だと全演算が FP32 (CUDA コア) で走る。
+    # データセンター GPU は FP32 ベクタ性能を意図的に削って Tensor Core と
+    # HBM に振っているため、この状態だとワークステーション GPU に負ける:
+    #
+    #     RTX PRO 6000 Blackwell : FP32 125 TFLOPS / 188 SM / 2617 MHz
+    #     L40S                   : FP32  92 TFLOPS
+    #     B200                   : FP32  75 TFLOPS (CUDAコア)
+    #     H200                   : FP32  67 TFLOPS / 132 SM / 1785 MHz
+    #
+    # 一方 Tensor Core を使えば H200 は BF16 で ~1000 TFLOPS (FP32比 約16倍)。
+    # つまり fp32 学習は H200/B200/B300 の性能の大半を捨てている。
+    # -----------------------------------------------------------------------
+    _cap = torch.cuda.get_device_capability(local_rank)
+    _props = torch.cuda.get_device_properties(local_rank)
+    if not hps.train.fp16_run and not hps.train.bf16_run:
+        if _cap[0] >= 8:  # Ampere 以降は bf16 の Tensor Core を持つ
+            logger.warning(
+                f"fp16_run/bf16_run が両方 False のため FP32 (CUDA コア) で学習します。"
+                f" {_props.name} (sm_{_cap[0]}{_cap[1]}) は bf16 Tensor Core を持つため、"
+                f" config.json の train.bf16_run を true にすると大幅に高速化します。"
+                f" SBV2_AUTO_BF16=1 で自動的に有効化できます。"
+            )
+            if os.environ.get("SBV2_AUTO_BF16", "0") == "1":
+                hps.train.bf16_run = True
+                logger.info("SBV2_AUTO_BF16=1: bf16 を自動で有効化しました。")
+        else:
+            logger.info(
+                f"{_props.name} (sm_{_cap[0]}{_cap[1]}) は bf16 非対応です。"
+                f" fp16_run: true を検討してください。"
+            )
+
+    # SM 占有率の警告: batch が小さいと SM 数の多い GPU ほど遊ぶ。
+    if _props.multi_processor_count >= 100 and hps.train.batch_size < 16:
+        logger.warning(
+            f"{_props.name} は SM が {_props.multi_processor_count} 基ありますが "
+            f"batch_size={hps.train.batch_size} です。"
+            f" この規模の GPU では batch_size を 16〜64 に上げてもステップ時間は"
+            f" ほとんど変わらず、スループットがほぼ線形に伸びます。"
+        )
+
+    if hps.train.fp16_run and hps.train.bf16_run:
+        logger.warning(
+            "Both fp16_run and bf16_run are set to True in config.json; fp16_run takes precedence."
+        )
+    if hps.train.fp16_run:
+        logger.info("Mixed precision training: fp16 (GradScaler enabled)")
+    elif hps.train.bf16_run:
+        logger.info("Mixed precision training: bf16")
+    else:
+        logger.info("Mixed precision training: disabled (fp32)")
+    # GradScaler は fp16 の勾配アンダーフロー対策としてのみ必要。
+    # bf16 は fp32 相当の指数レンジを持つため scaler は不要 (enabled=False で問題ない)。
+    scaler = GradScaler(enabled=hps.train.fp16_run)
     logger.info("Start training.")
 
     diff = abs(
@@ -700,6 +798,19 @@ def train_and_evaluate(
     # train_loader.batch_sampler.set_epoch(epoch)
     global global_step
 
+    # 混合精度モードの決定: bf6_run を優先し、次に fp16_run、両方 False なら fp32 (AMP無効)。
+    # T4 (Turing, sm_75) は bf16 の Tensor Core 演算に対応していないため、
+    # T4環境では config.json で fp16_run: true を指定することを推奨する。
+    if hps.train.bf16_run:
+        amp_dtype = torch.bfloat16
+        amp_enabled = True
+    elif hps.train.fp16_run:
+        amp_dtype = torch.float16
+        amp_enabled = True
+    else:
+        amp_dtype = torch.float32
+        amp_enabled = False
+
     net_g.train()
     net_d.train()
     if net_dur_disc is not None:
@@ -719,6 +830,13 @@ def train_and_evaluate(
         bert,
         style_vec,
     ) in enumerate(train_loader):
+        # 勾配ノルムはログ用のみ。通常ステップでは計測しないことで、GPU 同期を
+        # 発生させない。rank 0 以外はこの値を出力しないため計測不要。
+        log_this_step = (
+            rank == 0
+            and global_step % hps.train.log_interval == 0
+            and not hps.speedup
+        )
         if net_g.module.use_noise_scaled_mas:
             current_mas_noise_scale = (
                 net_g.module.mas_noise_scale_initial
@@ -740,7 +858,7 @@ def train_and_evaluate(
         bert = bert.cuda(local_rank, non_blocking=True)
         style_vec = style_vec.cuda(local_rank, non_blocking=True)
 
-        with autocast(enabled=hps.train.bf16_run, dtype=torch.bfloat16):
+        with autocast(enabled=amp_enabled, dtype=amp_dtype):
             (
                 y_hat,
                 l_length,
@@ -790,7 +908,7 @@ def train_and_evaluate(
 
             # Discriminator
             y_d_hat_r, y_d_hat_g, _, _ = net_d(y, y_hat.detach())
-            with autocast(enabled=hps.train.bf16_run, dtype=torch.bfloat16):
+            with autocast(enabled=amp_enabled, dtype=amp_dtype):
                 loss_disc, losses_disc_r, losses_disc_g = discriminator_loss(
                     y_d_hat_r, y_d_hat_g
                 )
@@ -803,7 +921,7 @@ def train_and_evaluate(
                     logw.detach(),
                     g.detach(),
                 )
-                with autocast(enabled=hps.train.bf16_run, dtype=torch.bfloat16):
+                with autocast(enabled=amp_enabled, dtype=amp_dtype):
                     # TODO: I think need to mean using the mask, but for now, just mean all
                     (
                         loss_dur_disc,
@@ -817,14 +935,11 @@ def train_and_evaluate(
                 # torch.nn.utils.clip_grad_norm_(
                 # parameters=net_dur_disc.parameters(), max_norm=5
                 # )
-                grad_norm_dur = commons.clip_grad_value_(
-                    net_dur_disc.parameters(), None
-                )
                 scaler.step(optim_dur_disc)
             if net_wd is not None:
                 # logger.debug(f"y.shape: {y.shape}, y_hat.shape: {y_hat.shape}")
                 # shape: (batch, 1, time)
-                with autocast(enabled=hps.train.bf16_run, dtype=torch.bfloat16):
+                with autocast(enabled=amp_enabled, dtype=amp_dtype):
                     loss_slm = wl.discriminator(
                         y.detach().squeeze(1), y_hat.detach().squeeze(1)
                     ).mean()
@@ -833,18 +948,24 @@ def train_and_evaluate(
                 scaler.scale(loss_slm).backward()
                 scaler.unscale_(optim_wd)
                 # torch.nn.utils.clip_grad_norm_(parameters=net_wd.parameters(), max_norm=200)
-                grad_norm_wd = commons.clip_grad_value_(net_wd.parameters(), None)
+                if log_this_step:
+                    grad_norm_wd = commons.clip_grad_value_(
+                        net_wd.parameters(), None
+                    )
                 scaler.step(optim_wd)
 
         optim_d.zero_grad()
         scaler.scale(loss_disc_all).backward()
         scaler.unscale_(optim_d)
-        if getattr(hps.train, "bf16_run", False):
+        if amp_enabled:
+            # fp16/bf16 いずれの混合精度時も、Discriminatorの勾配爆発対策として norm clipping を適用する。
+            # 特にfp16はbf16よりダイナミックレンジが狭くNaN化しやすいため、この安全策の意味が大きい。
             torch.nn.utils.clip_grad_norm_(parameters=net_d.parameters(), max_norm=200)
-        grad_norm_d = commons.clip_grad_value_(net_d.parameters(), None)
+        if log_this_step:
+            grad_norm_d = commons.clip_grad_value_(net_d.parameters(), None)
         scaler.step(optim_d)
 
-        with autocast(enabled=hps.train.bf16_run, dtype=torch.bfloat16):
+        with autocast(enabled=amp_enabled, dtype=amp_dtype):
             # Generator
             y_d_hat_r, y_d_hat_g, fmap_r, fmap_g = net_d(y, y_hat)
             if net_dur_disc is not None:
@@ -852,7 +973,7 @@ def train_and_evaluate(
             if net_wd is not None:
                 loss_lm = wl(y.detach().squeeze(1), y_hat.squeeze(1)).mean()
                 loss_lm_gen = wl.generator(y_hat.squeeze(1))
-            with autocast(enabled=hps.train.bf16_run, dtype=torch.bfloat16):
+            with autocast(enabled=amp_enabled, dtype=amp_dtype):
                 loss_dur = torch.sum(l_length.float())
                 loss_mel = F.l1_loss(y_mel, y_hat_mel) * hps.train.c_mel
                 loss_kl = kl_loss(z_p, logs_q, m_p, logs_p, z_mask) * hps.train.c_kl
@@ -871,14 +992,17 @@ def train_and_evaluate(
         optim_g.zero_grad()
         scaler.scale(loss_gen_all).backward()
         scaler.unscale_(optim_g)
-        # if getattr(hps.train, "bf16_run", False):
-        torch.nn.utils.clip_grad_norm_(parameters=net_g.parameters(), max_norm=500)
-        grad_norm_g = commons.clip_grad_value_(net_g.parameters(), None)
+        if amp_enabled:
+            # Discriminator側と同様、fp16/bf16 いずれの混合精度時も
+            # Generatorの勾配爆発対策として norm clipping を適用する(fp32時は元の挙動通り適用しない)。
+            torch.nn.utils.clip_grad_norm_(parameters=net_g.parameters(), max_norm=500)
+        if log_this_step:
+            grad_norm_g = commons.clip_grad_value_(net_g.parameters(), None)
         scaler.step(optim_g)
         scaler.update()
 
         if rank == 0:
-            if global_step % hps.train.log_interval == 0 and not hps.speedup:
+            if log_this_step:
                 lr = optim_g.param_groups[0]["lr"]
                 losses = [loss_disc, loss_gen, loss_fm, loss_mel, loss_dur, loss_kl]
                 # logger.info(
@@ -1040,8 +1164,25 @@ def train_and_evaluate(
             )
             pbar.update()
 
-    gc.collect()
-    torch.cuda.empty_cache()
+    # -----------------------------------------------------------------------
+    # [FIX 2] 毎エポックの gc.collect() + empty_cache() をやめる。
+    #
+    # empty_cache() は caching allocator が抱えている全セグメントを cudaFree し、
+    # デバイス全体を同期させる。次イテレーションではそれを cudaMalloc で取り直す。
+    # cudaMalloc/cudaFree のコストは GPU の物理メモリ量に比例して増えるため、
+    # 141GB (H200) / 180GB (B200) / 288GB (B300) の HBM カードでは
+    # 48GB (L40S) や 96GB (RTX6000Pro) より桁で重い。
+    #
+    # しかも SBV2 の典型的な用途 (数十〜数百 wav) では 1 エポック = 7〜8 ステップ
+    # しかないので、これは「7 イテレーションごとに1回」呼ばれることになり、
+    # 1 イテレーションあたりに均すと無視できないオーバーヘッドになる。
+    #
+    # OOM 対策として残したい場合は SBV2_GC_EVERY_N_EPOCH で間隔を指定する。
+    # -----------------------------------------------------------------------
+    _gc_every = int(os.environ.get("SBV2_GC_EVERY_N_EPOCH", "0"))
+    if _gc_every > 0 and epoch % _gc_every == 0:
+        gc.collect()
+        torch.cuda.empty_cache()
     if pbar is None and rank == 0:
         logger.info(f"====> Epoch: {epoch}, step: {global_step}")
 

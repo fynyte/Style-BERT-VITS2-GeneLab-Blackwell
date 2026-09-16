@@ -1,0 +1,143 @@
+--- a/train_ms_jp_extra.py
++++ b/train_ms_jp_extra.py
+@@ -44,11 +44,29 @@
+ )
+ torch.set_num_threads(1)
+ torch.set_float32_matmul_precision("medium")
+-torch.backends.cuda.sdp_kernel("flash")
++
++# ---------------------------------------------------------------------------
++# [FIX 1] cuDNN の conv アルゴリズム autotune を有効化する。
++#
++# 未設定 (= False) だと cuDNN はヒューリスティクスだけでアルゴリズムを選ぶ。
++# HiFi-GAN の Conv1d は「チャンネル数が小さく (16〜512)、系列長が非常に長い
++# (最終段で 16384)」という cuDNN にとって不得手な形をしており、ヒューリス
++# ティクスは sm_90 (H100/H200) / sm_100 (B200/B300) 上で頻繁に低速な
++# non-tensor-core エンジンを選ぶ。sm_75/86/89/120 系は長年チューニングされた
++# レガシーエンジンのカバレッジが広いため、この差が出にくい。
++#
++# vocoder / discriminator は rand_slice_segments の後なので入力形状が
++# segment_size 固定 = autotune が一度で収束する。前段 (text/posterior/flow) は
++# 可変長だが DistributedBucketSampler により形状の種類は限られる。
++# ---------------------------------------------------------------------------
++torch.backends.cudnn.benchmark = True
++
+ torch.backends.cuda.enable_flash_sdp(True)
+ torch.backends.cuda.enable_mem_efficient_sdp(
+     True
+ )  # Not available if torch version is lower than 2.0
++# 注: torch.backends.cuda.sdp_kernel("flash") は context manager を返すだけで
++#     `with` なしでは何の効果もない (かつ PyTorch 2.x では deprecated)。削除。
+ 
+ config = get_config()
+ global_step = 0
+@@ -392,6 +410,31 @@
+         )
+     else:
+         optim_wd = None
++    # -----------------------------------------------------------------------
++    # [FIX 4] (任意) 形状が固定な部分だけ torch.compile する。
++    #
++    # VITS の 1 ステップは数千〜1万本の細かいカーネルを発行する。カーネルが
++    # 速い GPU ほど「GPU が空回りして CPU のローンチ待ちになる」領域に入るため、
++    # H200/B200/B300 では特に効く。
++    #
++    # 前段 (text encoder / posterior encoder / flow) は系列長が可変で再コンパイル
++    # が多発するので触らない。rand_slice_segments より後の
++    #   - net_g.dec      (HiFi-GAN Generator)
++    #   - net_d          (MPD/MRD)
++    # は入力が segment_size 固定なので安全にコンパイルできる。
++    #
++    #   SBV2_COMPILE=1                   -> 有効化
++    #   SBV2_COMPILE_MODE=reduce-overhead -> CUDA Graphs でローンチ律速を潰す
++    # -----------------------------------------------------------------------
++    if os.environ.get("SBV2_COMPILE", "0") == "1":
++        _mode = os.environ.get("SBV2_COMPILE_MODE", "max-autotune-no-cudagraphs")
++        try:
++            net_g.dec = torch.compile(net_g.dec, mode=_mode, dynamic=False)
++            net_d = torch.compile(net_d, mode=_mode, dynamic=False)
++            logger.info(f"torch.compile enabled (mode={_mode}) for net_g.dec / net_d")
++        except Exception as e:
++            logger.warning(f"torch.compile failed, continuing eagerly: {e}")
++
+     net_g = DDP(
+         net_g,
+         device_ids=[local_rank],
+@@ -549,6 +592,49 @@
+     else:
+         scheduler_wd = None
+         wl = None
++    # -----------------------------------------------------------------------
++    # [FIX 3] Tensor Core を使わせる / 使えていない場合に警告する。
++    #
++    # fp16_run も bf16_run も False だと全演算が FP32 (CUDA コア) で走る。
++    # データセンター GPU は FP32 ベクタ性能を意図的に削って Tensor Core と
++    # HBM に振っているため、この状態だとワークステーション GPU に負ける:
++    #
++    #     RTX PRO 6000 Blackwell : FP32 125 TFLOPS / 188 SM / 2617 MHz
++    #     L40S                   : FP32  92 TFLOPS
++    #     B200                   : FP32  75 TFLOPS (CUDAコア)
++    #     H200                   : FP32  67 TFLOPS / 132 SM / 1785 MHz
++    #
++    # 一方 Tensor Core を使えば H200 は BF16 で ~1000 TFLOPS (FP32比 約16倍)。
++    # つまり fp32 学習は H200/B200/B300 の性能の大半を捨てている。
++    # -----------------------------------------------------------------------
++    _cap = torch.cuda.get_device_capability(local_rank)
++    _props = torch.cuda.get_device_properties(local_rank)
++    if not hps.train.fp16_run and not hps.train.bf16_run:
++        if _cap[0] >= 8:  # Ampere 以降は bf16 の Tensor Core を持つ
++            logger.warning(
++                f"fp16_run/bf16_run が両方 False のため FP32 (CUDA コア) で学習します。"
++                f" {_props.name} (sm_{_cap[0]}{_cap[1]}) は bf16 Tensor Core を持つため、"
++                f" config.json の train.bf16_run を true にすると大幅に高速化します。"
++                f" SBV2_AUTO_BF16=1 で自動的に有効化できます。"
++            )
++            if os.environ.get("SBV2_AUTO_BF16", "0") == "1":
++                hps.train.bf16_run = True
++                logger.info("SBV2_AUTO_BF16=1: bf16 を自動で有効化しました。")
++        else:
++            logger.info(
++                f"{_props.name} (sm_{_cap[0]}{_cap[1]}) は bf16 非対応です。"
++                f" fp16_run: true を検討してください。"
++            )
++
++    # SM 占有率の警告: batch が小さいと SM 数の多い GPU ほど遊ぶ。
++    if _props.multi_processor_count >= 100 and hps.train.batch_size < 16:
++        logger.warning(
++            f"{_props.name} は SM が {_props.multi_processor_count} 基ありますが "
++            f"batch_size={hps.train.batch_size} です。"
++            f" この規模の GPU では batch_size を 16〜64 に上げてもステップ時間は"
++            f" ほとんど変わらず、スループットがほぼ線形に伸びます。"
++        )
++
+     if hps.train.fp16_run and hps.train.bf16_run:
+         logger.warning(
+             "Both fp16_run and bf16_run are set to True in config.json; fp16_run takes precedence."
+@@ -1078,8 +1164,25 @@
+             )
+             pbar.update()
+ 
+-    gc.collect()
+-    torch.cuda.empty_cache()
++    # -----------------------------------------------------------------------
++    # [FIX 2] 毎エポックの gc.collect() + empty_cache() をやめる。
++    #
++    # empty_cache() は caching allocator が抱えている全セグメントを cudaFree し、
++    # デバイス全体を同期させる。次イテレーションではそれを cudaMalloc で取り直す。
++    # cudaMalloc/cudaFree のコストは GPU の物理メモリ量に比例して増えるため、
++    # 141GB (H200) / 180GB (B200) / 288GB (B300) の HBM カードでは
++    # 48GB (L40S) や 96GB (RTX6000Pro) より桁で重い。
++    #
++    # しかも SBV2 の典型的な用途 (数十〜数百 wav) では 1 エポック = 7〜8 ステップ
++    # しかないので、これは「7 イテレーションごとに1回」呼ばれることになり、
++    # 1 イテレーションあたりに均すと無視できないオーバーヘッドになる。
++    #
++    # OOM 対策として残したい場合は SBV2_GC_EVERY_N_EPOCH で間隔を指定する。
++    # -----------------------------------------------------------------------
++    _gc_every = int(os.environ.get("SBV2_GC_EVERY_N_EPOCH", "0"))
++    if _gc_every > 0 and epoch % _gc_every == 0:
++        gc.collect()
++        torch.cuda.empty_cache()
+     if pbar is None and rank == 0:
+         logger.info(f"====> Epoch: {epoch}, step: {global_step}")
+ 
