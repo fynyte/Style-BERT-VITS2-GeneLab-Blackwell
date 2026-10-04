@@ -196,7 +196,6 @@ class WN(torch.nn.Module):
         **kwargs: Any,
     ) -> torch.Tensor:
         output = torch.zeros_like(x)
-        n_channels_tensor = torch.IntTensor([self.hidden_channels])
 
         if g is not None:
             g = self.cond_layer(g)
@@ -209,7 +208,9 @@ class WN(torch.nn.Module):
             else:
                 g_l = torch.zeros_like(x_in)
 
-            acts = commons.fused_add_tanh_sigmoid_multiply(x_in, g_l, n_channels_tensor)
+            acts = commons.fused_add_tanh_sigmoid_multiply(
+                x_in, g_l, self.hidden_channels
+            )
             acts = self.drop(acts)
 
             res_skip_acts = self.res_skip_layers[i](acts)
@@ -410,7 +411,11 @@ class Flip(nn.Module):
     ) -> Union[tuple[torch.Tensor, torch.Tensor], torch.Tensor]:
         x = torch.flip(x, [1])
         if not reverse:
-            logdet = torch.zeros(x.size(0)).to(dtype=x.dtype, device=x.device)
+            # 元は `torch.zeros(x.size(0)).to(dtype=x.dtype, device=x.device)` で、CPU 上に作った
+            # テンソルをページ不可メモリから GPU へ「同期コピー」していた (= 呼ぶたびに
+            # cudaStreamSynchronize 相当の強制同期。学習 1 ステップで Flip は 12 回呼ばれる)。
+            # 最初からデバイス上に作れば同期は起きず、値 (ゼロ) は同じ。
+            logdet = torch.zeros(x.size(0), dtype=x.dtype, device=x.device)
             return x, logdet
         else:
             return x

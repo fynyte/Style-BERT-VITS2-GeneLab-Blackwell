@@ -33,6 +33,29 @@ def _assert_finite(tensor: Optional[torch.Tensor], name: str) -> None:
         )
 
 
+def _std_over_batch_max(
+    neg_cent: torch.Tensor, x_lengths: torch.Tensor, y_lengths: torch.Tensor
+) -> torch.Tensor:
+    """`torch.std(neg_cent)` を「バッチ内の最大長までしかパディングされていない場合」と同じ値で返す。
+
+    従来の collate はバッチ内最大の長さまでパディングするので、`torch.std(neg_cent)` の対象は
+    [b, max(y_lengths), max(x_lengths)] の範囲だった。CUDA Graph 用にバケット上限まで余分に
+    パディングする (静的形状) と、その余白まで std の計算に入って MAS ノイズの大きさが変わってしまう。
+    ここでは長さのテンソルから範囲をマスクで切り出して、元と同じ母集団の std (不偏) を計算する。
+    形状もデータ依存の分岐も無く、GPU 同期も起きない。
+
+    neg_cent: [b, t_y (スペクトログラムのフレーム), t_x (テキスト)]
+    """
+    b, t_y, t_x = neg_cent.shape
+    rows = torch.arange(t_y, device=neg_cent.device) < y_lengths.max()
+    cols = torch.arange(t_x, device=neg_cent.device) < x_lengths.max()
+    m = (rows.unsqueeze(1) & cols.unsqueeze(0)).to(neg_cent.dtype)
+    n = (rows.sum() * cols.sum() * b).to(neg_cent.dtype)
+    mean = (neg_cent * m).sum() / n
+    var = (((neg_cent - mean) * m) ** 2).sum() / (n - 1)
+    return var.sqrt()
+
+
 class DurationDiscriminator(nn.Module):  # vits2
     def __init__(
         self,
@@ -256,8 +279,14 @@ class StochasticDurationPredictor(nn.Module):
             h_w = self.post_pre(w)
             h_w = self.post_convs(h_w, x_mask)
             h_w = self.post_proj(h_w) * x_mask
+            # 元は `torch.randn(...)` を CPU で生成してから `.to(device=...)` していた。
+            # ページ不可メモリからの同期コピーなので毎ステップ強制的に GPU 同期が発生し、
+            # CUDA Graph のキャプチャも不可能だった。デバイス上で直接生成する (分布は同一)。
+            # fp32 で生成してから dtype を合わせる点も元の挙動 (fp32 生成→cast) と同じ。
             e_q = (
-                torch.randn(w.size(0), 2, w.size(2)).to(device=x.device, dtype=x.dtype)
+                torch.randn(
+                    w.size(0), 2, w.size(2), device=x.device, dtype=torch.float32
+                ).to(dtype=x.dtype)
                 * x_mask
             )
             z_q = e_q
@@ -291,7 +320,9 @@ class StochasticDurationPredictor(nn.Module):
             flows = list(reversed(self.flows))
             flows = flows[:-2] + [flows[-1]]  # remove a useless vflow
             z = (
-                torch.randn(x.size(0), 2, x.size(2)).to(device=x.device, dtype=x.dtype)
+                torch.randn(
+                    x.size(0), 2, x.size(2), device=x.device, dtype=torch.float32
+                ).to(dtype=x.dtype)
                 * noise_scale
             )
             for flow in flows:
@@ -964,6 +995,9 @@ class SynthesizerTrn(nn.Module):
         self.mas_noise_scale_initial = kwargs.get("mas_noise_scale_initial", 0.01)
         self.noise_scale_delta = kwargs.get("noise_scale_delta", 2e-6)
         self.current_mas_noise_scale = self.mas_noise_scale_initial
+        # True のとき、MAS ノイズの標準偏差を「バッチ内最大長までのパディング」と同じ範囲で計算する。
+        # 静的形状 (バケット上限までパディング) の collate + CUDA Graph 学習のときに有効化される。
+        self.mas_std_over_batch_max = False
         if self.use_spk_conditioned_encoder and gin_channels > 0:
             self.enc_gin_channels = gin_channels
         self.enc_p = TextEncoder(
@@ -1079,8 +1113,12 @@ class SynthesizerTrn(nn.Module):
             )  # [b, 1, t_s]
             neg_cent = neg_cent1 + neg_cent2 + neg_cent3 + neg_cent4
             if self.use_noise_scaled_mas:
+                if self.mas_std_over_batch_max:
+                    mas_std = _std_over_batch_max(neg_cent, x_lengths, y_lengths)
+                else:
+                    mas_std = torch.std(neg_cent)
                 epsilon = (
-                    torch.std(neg_cent)
+                    mas_std
                     * torch.randn_like(neg_cent)
                     * self.current_mas_noise_scale
                 )

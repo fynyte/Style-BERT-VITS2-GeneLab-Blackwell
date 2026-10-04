@@ -251,8 +251,11 @@ class StochasticDurationPredictor(nn.Module):
             h_w = self.post_pre(w)
             h_w = self.post_convs(h_w, x_mask)
             h_w = self.post_proj(h_w) * x_mask
+            # CPU で乱数を作って GPU へ同期コピーすると毎ステップ強制同期になるため、デバイス上で生成する。
             e_q = (
-                torch.randn(w.size(0), 2, w.size(2)).to(device=x.device, dtype=x.dtype)
+                torch.randn(
+                    w.size(0), 2, w.size(2), device=x.device, dtype=torch.float32
+                ).to(dtype=x.dtype)
                 * x_mask
             )
             z_q = e_q
@@ -286,7 +289,9 @@ class StochasticDurationPredictor(nn.Module):
             flows = list(reversed(self.flows))
             flows = flows[:-2] + [flows[-1]]  # remove a useless vflow
             z = (
-                torch.randn(x.size(0), 2, x.size(2)).to(device=x.device, dtype=x.dtype)
+                torch.randn(
+                    x.size(0), 2, x.size(2), device=x.device, dtype=torch.float32
+                ).to(dtype=x.dtype)
                 * noise_scale
             )
             for flow in flows:

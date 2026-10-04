@@ -76,6 +76,7 @@ class TextAudioSpeakerLoader(torch.utils.data.Dataset):
 
         audiopaths_sid_text_new = []
         lengths = []
+        text_lengths = []
         skipped = 0
         logger.info("Init dataset...")
         for _id, spk, language, text, phones, tone, word2ph in tqdm(
@@ -90,6 +91,9 @@ class TextAudioSpeakerLoader(torch.utils.data.Dataset):
                 [audiopath, spk, language, text, phones, tone, word2ph]
             )
             lengths.append(os.path.getsize(audiopath) // (2 * self.hop_length))
+            # get_text() と同じ規則 (add_blank なら intersperse で 2n+1) でテキスト長を記録。
+            # 静的形状 collate (StaticShapeTable) がバケットごとのテキスト長の上限を決めるのに使う。
+            text_lengths.append(len(phones) * 2 + 1 if self.add_blank else len(phones))
             # else:
             #     skipped += 1
         logger.info(
@@ -100,6 +104,7 @@ class TextAudioSpeakerLoader(torch.utils.data.Dataset):
         )
         self.audiopaths_sid_text = audiopaths_sid_text_new
         self.lengths = lengths
+        self.text_lengths = text_lengths
 
     def _preload(self):
         """
@@ -252,12 +257,69 @@ class TextAudioSpeakerLoader(torch.utils.data.Dataset):
         return len(self.audiopaths_sid_text)
 
 
+class StaticShapeTable:
+    """バッチの形状をバケット単位で固定するための表 (CUDA Graph 用)。
+
+    従来の collate はバッチ内の最大長までパディングするので、バッチごとにテンソル形状が変わる。
+    CUDA Graph は形状ごとに 1 つ必要なので、ここではスペクトログラム長をバケット上限
+    (DistributedBucketSampler の境界) まで、テキスト長をそのバケットで起こりうる最大値まで
+    パディングして、形状の種類をバケット数 (高々 8 前後) に抑える。
+    パディングはゼロ埋め + x_lengths / spec_lengths によるマスクなので、学習の意味は変わらない
+    (MAS ノイズの std だけは models_jp_extra._std_over_batch_max で従来と同じ範囲に揃えている)。
+    """
+
+    def __init__(
+        self,
+        spec_bounds,
+        text_pad,
+        hop_length,
+    ):
+        self.spec_bounds = sorted(int(b) for b in spec_bounds)
+        self.text_pad = {int(k): int(v) for k, v in text_pad.items()}
+        self.hop_length = int(hop_length)
+        self.n_dynamic = 0  # テーブルに収まらず従来どおりの動的形状になった回数
+
+    @classmethod
+    def from_sampler(cls, dataset, sampler, hop_length, text_multiple=8):
+        """DistributedBucketSampler の境界 (空バケット除去後) とデータセットの長さから作る。"""
+        bounds = list(sampler.boundaries[1:])
+        lengths = dataset.lengths
+        text_lengths = dataset.text_lengths
+        text_pad = {}
+        for b in bounds:
+            # サンプラーの長さ (ファイルサイズ由来) は実際のフレーム数より高々 1 大きいので、
+            # 「b + 1 以下のサンプル」を累積して余裕を持たせる (境界ちょうどのバッチも収まる)
+            m = 1
+            for length, tl in zip(lengths, text_lengths):
+                if length <= b + 1 and tl > m:
+                    m = tl
+            text_pad[b] = -(-m // text_multiple) * text_multiple
+        return cls(bounds, text_pad, hop_length)
+
+    def resolve(self, text_len, spec_len, wav_len):
+        """バッチ内の最大長 (text, spec, wav) を静的形状に引き上げる。表に収まらなければそのまま返す。"""
+        for b in self.spec_bounds:
+            if spec_len <= b:
+                return (
+                    max(text_len, self.text_pad[b]),
+                    b,
+                    max(wav_len, b * self.hop_length),
+                )
+        self.n_dynamic += 1
+        return text_len, spec_len, wav_len
+
+    def shapes(self):
+        return [(b, self.text_pad[b]) for b in self.spec_bounds]
+
+
 class TextAudioSpeakerCollate:
     """Zero-pads model inputs and targets"""
 
-    def __init__(self, return_ids=False, use_jp_extra=False):
+    def __init__(self, return_ids=False, use_jp_extra=False, static_table=None):
         self.return_ids = return_ids
         self.use_jp_extra = use_jp_extra
+        # StaticShapeTable を渡すと、バッチ内最大長ではなくバケット上限までパディングする
+        self.static_table = static_table
 
     def __call__(self, batch):
         """Collate's training batch from normalized text, audio and speaker identities
@@ -273,6 +335,10 @@ class TextAudioSpeakerCollate:
         max_text_len = max([len(x[0]) for x in batch])
         max_spec_len = max([x[1].size(1) for x in batch])
         max_wav_len = max([x[2].size(1) for x in batch])
+        if self.static_table is not None:
+            max_text_len, max_spec_len, max_wav_len = self.static_table.resolve(
+                max_text_len, max_spec_len, max_wav_len
+            )
 
         text_lengths = torch.LongTensor(len(batch))
         spec_lengths = torch.LongTensor(len(batch))

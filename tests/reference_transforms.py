@@ -1,3 +1,8 @@
+# ---------------------------------------------------------------------------------------------
+# 参照用: 変更前 (GPU 同期あり) の style_bert_vits2/models/transforms.py をそのまま保存したもの。
+# tests/test_spline_equiv.py が、同期フリー版との数値一致 (順方向・逆方向・勾配) を確認するためだけに使う。
+# 学習・推論コードからは import されない。
+# ---------------------------------------------------------------------------------------------
 from typing import Optional
 
 import numpy as np
@@ -63,40 +68,32 @@ def unconstrained_rational_quadratic_spline(
     min_bin_height: float = DEFAULT_MIN_BIN_HEIGHT,
     min_derivative: float = DEFAULT_MIN_DERIVATIVE,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """
-    [GPU 同期フリー版]
-
-    元の実装は `inputs[inside_interval_mask]` のような「ブール値マスクによる抽出/代入」で
-    区間内の要素だけにスプラインを適用していた。ブール値マスクのインデックス操作は出力サイズが
-    データ依存になるため、内部で nonzero 相当の処理 = GPU→CPU 同期を毎回発生させる
-    (SDP の ConvFlow 8 回 × (順伝播 9 + 逆伝播 9) = 1 ステップあたり 144 回)。
-    また、その直前の `torch.min(inputs) < left` 等の検査も同期点だった (16 回)。
-
-    ここでは
-      1. 全要素を区間 [-tail_bound, tail_bound] に clamp してからスプラインを「全要素に」適用し、
-      2. torch.where で 区間内: スプライン結果 / 区間外: 入力そのまま (logabsdet は 0) を選ぶ
-    ことで、同期なし・出力形状が静的、かつ元の実装と数学的に同一の結果を得る。
-
-    - 区間内の要素: clamp は恒等写像なので元の実装と完全に同じ計算になる。
-    - 区間外の要素: where が入力をそのまま選ぶので出力・logabsdet は元と同じ。
-      選ばれなかった側のスプライン計算へ流れる勾配は 0 で、clamp 後の境界値は有限値なので
-      NaN/Inf は発生しない (勾配も元の実装と一致する)。
-    """
-    if tails != "linear":
-        raise RuntimeError(f"{tails} tails are not implemented.")
 
     inside_interval_mask = (inputs >= -tail_bound) & (inputs <= tail_bound)
+    outside_interval_mask = ~inside_interval_mask
 
-    unnormalized_derivatives = F.pad(unnormalized_derivatives, pad=(1, 1))
-    constant = np.log(np.exp(1 - min_derivative) - 1)
-    unnormalized_derivatives[..., 0] = constant
-    unnormalized_derivatives[..., -1] = constant
+    outputs = torch.zeros_like(inputs)
+    logabsdet = torch.zeros_like(inputs)
 
-    spline_outputs, spline_logabsdet = rational_quadratic_spline(
-        inputs=inputs.clamp(min=-tail_bound, max=tail_bound),
-        unnormalized_widths=unnormalized_widths,
-        unnormalized_heights=unnormalized_heights,
-        unnormalized_derivatives=unnormalized_derivatives,
+    if tails == "linear":
+        unnormalized_derivatives = F.pad(unnormalized_derivatives, pad=(1, 1))
+        constant = np.log(np.exp(1 - min_derivative) - 1)
+        unnormalized_derivatives[..., 0] = constant
+        unnormalized_derivatives[..., -1] = constant
+
+        outputs[outside_interval_mask] = inputs[outside_interval_mask]
+        logabsdet[outside_interval_mask] = 0
+    else:
+        raise RuntimeError(f"{tails} tails are not implemented.")
+
+    (
+        outputs[inside_interval_mask],
+        logabsdet[inside_interval_mask],
+    ) = rational_quadratic_spline(
+        inputs=inputs[inside_interval_mask],
+        unnormalized_widths=unnormalized_widths[inside_interval_mask, :],
+        unnormalized_heights=unnormalized_heights[inside_interval_mask, :],
+        unnormalized_derivatives=unnormalized_derivatives[inside_interval_mask, :],
         inverse=inverse,
         left=-tail_bound,
         right=tail_bound,
@@ -105,13 +102,8 @@ def unconstrained_rational_quadratic_spline(
         min_bin_width=min_bin_width,
         min_bin_height=min_bin_height,
         min_derivative=min_derivative,
-        check_domain=False,
     )
 
-    outputs = torch.where(inside_interval_mask, spline_outputs, inputs)
-    logabsdet = torch.where(
-        inside_interval_mask, spline_logabsdet, torch.zeros_like(spline_logabsdet)
-    )
     return outputs, logabsdet
 
 
@@ -128,14 +120,9 @@ def rational_quadratic_spline(
     min_bin_width: float = DEFAULT_MIN_BIN_WIDTH,
     min_bin_height: float = DEFAULT_MIN_BIN_HEIGHT,
     min_derivative: float = DEFAULT_MIN_DERIVATIVE,
-    check_domain: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """
-    check_domain=True (既定) の場合は元の実装と同じく入力範囲の検査 (GPU 同期を伴う) を行う。
-    unconstrained_rational_quadratic_spline は入力を clamp 済みなので check_domain=False で呼ぶ。
-    """
 
-    if check_domain and (torch.min(inputs) < left or torch.max(inputs) > right):
+    if torch.min(inputs) < left or torch.max(inputs) > right:
         raise ValueError("Input to a transform is not within its domain")
 
     num_bins = unnormalized_widths.shape[-1]
@@ -192,13 +179,7 @@ def rational_quadratic_spline(
         c = -input_delta * (inputs - input_cumheights)
 
         discriminant = b.pow(2) - 4 * a * c
-        if check_domain:
-            # 元の実装の検査 (GPU 同期を伴う)。直接呼び出し時のみ有効。
-            assert (discriminant >= 0).all()
-        else:
-            # clamp で境界に置かれた要素 (最終的に where で捨てられる) の判別式が、丸め誤差で
-            # わずかに負になっても NaN が生じないようにする。数学的には常に discriminant >= 0。
-            discriminant = discriminant.clamp_min(0)
+        assert (discriminant >= 0).all()
 
         root = (2 * c) / (-b - torch.sqrt(discriminant))
         outputs = root * input_bin_widths + input_cumwidths

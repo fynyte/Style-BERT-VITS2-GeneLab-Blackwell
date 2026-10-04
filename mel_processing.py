@@ -1,3 +1,4 @@
+import os
 import warnings
 
 import torch
@@ -8,6 +9,23 @@ from librosa.filters import mel as librosa_mel_fn
 # warnings.simplefilter(action='ignore', category=FutureWarning)
 warnings.filterwarnings(action="ignore")
 MAX_WAV_VALUE = 32768.0
+
+# 入力波形の範囲検査 (min < -1 / max > 1 のとき print するだけのデバッグ出力)。
+# `if torch.min(y) < -1.0:` は Python の bool() 変換のため、y が CUDA テンソルだと
+# 呼ぶたびに GPU→CPU の強制同期 (学習 1 ステップあたり 2 回) になり、CUDA Graph の
+# キャプチャも不可能になる。CPU テンソル (データセット前処理) では同期コストがないので
+# 従来どおり検査し、CUDA テンソルでは環境変数 SBV2_MEL_RANGE_CHECK=1 のときだけ検査する。
+_MEL_RANGE_CHECK_CUDA = os.environ.get("SBV2_MEL_RANGE_CHECK", "0") == "1"
+
+
+def _report_wave_range(y: torch.Tensor) -> None:
+    # CPU 以外 (CUDA など) のテンソルでは、環境変数で明示しない限り検査しない
+    if y.device.type != "cpu" and not _MEL_RANGE_CHECK_CUDA:
+        return
+    if torch.min(y) < -1.0:
+        print("min value is ", torch.min(y))
+    if torch.max(y) > 1.0:
+        print("max value is ", torch.max(y))
 
 
 def dynamic_range_compression_torch(x, C=1, clip_val=1e-5):
@@ -43,10 +61,7 @@ hann_window = {}
 
 
 def spectrogram_torch(y, n_fft, sampling_rate, hop_size, win_size, center=False):
-    if torch.min(y) < -1.0:
-        print("min value is ", torch.min(y))
-    if torch.max(y) > 1.0:
-        print("max value is ", torch.max(y))
+    _report_wave_range(y)
 
     global hann_window
     dtype_device = str(y.dtype) + "_" + str(y.device)
@@ -99,10 +114,7 @@ def spec_to_mel_torch(spec, n_fft, num_mels, sampling_rate, fmin, fmax):
 def mel_spectrogram_torch(
     y, n_fft, num_mels, sampling_rate, hop_size, win_size, fmin, fmax, center=False
 ):
-    if torch.min(y) < -1.0:
-        print("min value is ", torch.min(y))
-    if torch.max(y) > 1.0:
-        print("max value is ", torch.max(y))
+    _report_wave_range(y)
 
     global mel_basis, hann_window
     dtype_device = str(y.dtype) + "_" + str(y.device)

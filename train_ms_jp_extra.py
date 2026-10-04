@@ -3,6 +3,8 @@ import datetime
 import gc
 import os
 import platform
+import time
+from typing import Optional
 
 import torch
 import torch.distributed as dist
@@ -20,8 +22,15 @@ import default_style
 from config import get_config
 from data_utils import (
     DistributedBucketSampler,
+    StaticShapeTable,
     TextAudioSpeakerCollate,
     TextAudioSpeakerLoader,
+)
+from cuda_graph_step import (
+    GraphedTrainStep,
+    SingleProcessWrapper,
+    StepConfig,
+    decide_cuda_graph,
 )
 from losses import WavLMLoss, discriminator_loss, feature_loss, generator_loss, kl_loss
 from mel_processing import mel_spectrogram_torch, spec_to_mel_torch
@@ -52,6 +61,50 @@ torch.backends.cuda.enable_mem_efficient_sdp(
 
 config = get_config()
 global_step = 0
+_last_cleanup_step = 0
+
+
+class _PerfMeter:
+    """ログ間隔ごとの実効速度 (s/step) と、DataLoader を待っていた時間の割合を出す。
+
+    CUDA Graph にすると 1 step の CPU 側の処理は一瞬で終わる (GPU への投入だけ) ので、tqdm の
+    s/it は実際の速度とずれて見える。ここではログ step の GPU 同期を含む区間平均を出すので、
+    実際のスループットを表す (評価・チェックポイント保存の時間も含む)。
+    「DataLoader 待ち」の割合が大きければ、GPU ではなくデータ供給が律速になっている
+    (環境変数 SBV2_NUM_WORKERS を 2, 3 と増やす)。
+    """
+
+    def __init__(self) -> None:
+        self.reset()
+
+    def reset(self) -> None:
+        self.t0 = time.perf_counter()
+        self.steps = 0
+        self.wait = 0.0
+        self.t_end: Optional[float] = None
+
+    def before_step(self) -> None:
+        # 直前の step の終わりから、次のバッチが手元に届くまで
+        if self.t_end is not None:
+            self.wait += time.perf_counter() - self.t_end
+
+    def after_step(self) -> None:
+        self.steps += 1
+        self.t_end = time.perf_counter()
+
+    def report(self) -> Optional[str]:
+        elapsed = time.perf_counter() - self.t0
+        msg = None
+        if self.steps >= 5 and elapsed > 0:
+            msg = (
+                f"[perf] 直近 {self.steps} step: {elapsed / self.steps:.3f} s/step "
+                f"({self.steps / elapsed:.2f} it/s), DataLoader 待ち {self.wait / elapsed:.0%}"
+            )
+        self.reset()
+        return msg
+
+
+_perf = _PerfMeter()
 
 api = HfApi()
 
@@ -103,6 +156,17 @@ def run():
         "--not_use_custom_batch_sampler",
         help="Don't use custom batch sampler for training, which was used in the version < 2.5",
         action="store_true",
+    )
+    parser.add_argument(
+        "--cuda_graph",
+        choices=["auto", "on", "off"],
+        default=None,
+        help=(
+            "学習 1 step を CUDA Graph にして CPU (Python/カーネル起動) 律速を解消する。"
+            " auto: Hopper 以降 (sm_90+: H100/H200/B200/B300/RTX PRO 6000 等) で有効 / on: 強制 / off: 無効。"
+            " 未指定なら環境変数 SBV2_CUDA_GRAPH (既定 auto)。"
+            " bf16/fp32・単一 GPU・duration/WavLM discriminator 無し・バケットサンプラー使用時のみ。"
+        ),
     )
     args = parser.parse_args()
 
@@ -209,6 +273,21 @@ def run():
     torch.manual_seed(hps.train.seed)
     torch.cuda.set_device(local_rank)
 
+    # CUDA Graph 学習の可否 (cuda_graph_step.py)。False なら従来の学習ループがそのまま動く。
+    use_cuda_graph, cuda_graph_reason = decide_cuda_graph(
+        args.cuda_graph or os.environ.get("SBV2_CUDA_GRAPH", "auto"),
+        world_size=n_gpus,
+        fp16_run=bool(hps.train.fp16_run),
+        has_dur_disc=bool(hps.model.use_duration_discriminator),
+        has_wavlm=bool(hps.model.use_wavlm_discriminator),
+        custom_batch_sampler=not args.not_use_custom_batch_sampler,
+        device=torch.device("cuda", local_rank),
+    )
+    if use_cuda_graph:
+        logger.info(f"CUDA Graph training: ON ({cuda_graph_reason})")
+    else:
+        logger.info(f"CUDA Graph training: OFF ({cuda_graph_reason})")
+
     global global_step
     writer = None
     writer_eval = None
@@ -229,17 +308,33 @@ def run():
             rank=rank,
             shuffle=True,
         )
+        train_collate_fn = collate_fn
+        if use_cuda_graph:
+            # バッチ形状をバケット単位で固定 (スペクトログラム長=バケット上限、テキスト長=バケット内最大)
+            static_table = StaticShapeTable.from_sampler(
+                train_dataset, train_sampler, hps.data.hop_length
+            )
+            train_collate_fn = TextAudioSpeakerCollate(
+                use_jp_extra=True, static_table=static_table
+            )
+            logger.info(
+                "CUDA Graph: static batch shapes (spec_len, text_len) = "
+                f"{static_table.shapes()}"
+            )
+        # データ読み込みワーカー数 (既定 1 = 従来どおり。CUDA Graph で step が速くなって
+        # データ供給が間に合わない場合だけ SBV2_NUM_WORKERS=2.. に上げる)
+        train_num_workers = int(os.environ.get("SBV2_NUM_WORKERS", "1"))
         train_loader = DataLoader(
             train_dataset,
             # メモリ消費量を減らそうとnum_workersを1にしてみる
             # num_workers=min(config.train_ms_config.num_workers, os.cpu_count() // 2),
-            num_workers=1,
+            num_workers=train_num_workers,
             shuffle=False,
             pin_memory=True,
-            collate_fn=collate_fn,
+            collate_fn=train_collate_fn,
             batch_sampler=train_sampler,
             # batch_size=hps.train.batch_size,
-            persistent_workers=True,
+            persistent_workers=train_num_workers > 0,
             # これもメモリ消費量を減らそうとしてコメントアウト
             # prefetch_factor=6,
         )
@@ -392,16 +487,23 @@ def run():
         )
     else:
         optim_wd = None
-    net_g = DDP(
-        net_g,
-        device_ids=[local_rank],
-        # bucket_cap_mb=512
-    )
-    net_d = DDP(
-        net_d,
-        device_ids=[local_rank],
-        # bucket_cap_mb=512
-    )
+    if use_cuda_graph:
+        # 単一 GPU では DDP は何も同期しない (フックが付くだけ) ので、`.module` だけ互換の薄いラッパにする。
+        net_g = SingleProcessWrapper(net_g)
+        net_d = SingleProcessWrapper(net_d)
+        # 静的形状 (バケット上限までパディング) でも MAS ノイズの std を従来と同じ範囲で計算する
+        net_g.module.mas_std_over_batch_max = True
+    else:
+        net_g = DDP(
+            net_g,
+            device_ids=[local_rank],
+            # bucket_cap_mb=512
+        )
+        net_d = DDP(
+            net_d,
+            device_ids=[local_rank],
+            # bucket_cap_mb=512
+        )
     if net_dur_disc is not None:
         net_dur_disc = DDP(
             net_dur_disc,
@@ -562,6 +664,31 @@ def run():
     # GradScaler は fp16 の勾配アンダーフロー対策としてのみ必要。
     # bf16 は fp32 相当の指数レンジを持つため scaler は不要 (enabled=False で問題ない)。
     scaler = GradScaler(enabled=hps.train.fp16_run)
+
+    graph_runner = None
+    if use_cuda_graph:
+        try:
+            graph_runner = GraphedTrainStep(
+                net_g,
+                net_d,
+                optim_g,
+                optim_d,
+                StepConfig.from_hps(
+                    hps,
+                    amp_enabled=bool(hps.train.bf16_run),
+                    amp_dtype=torch.bfloat16 if hps.train.bf16_run else torch.float32,
+                ),
+                device=torch.device("cuda", local_rank),
+            )
+            logger.info(
+                "CUDA Graph: 形状ごとに 1 回目は eager (ウォームアップ)、2 回目で capture、"
+                "3 回目以降は replay します。失敗時は自動的に eager に戻ります。"
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.warning(
+                f"CUDA Graph の初期化に失敗したため従来の学習ループで続行します: {type(e).__name__}: {e}"
+            )
+            graph_runner = None
     logger.info("Start training.")
 
     diff = abs(
@@ -594,6 +721,7 @@ def run():
                 [writer, writer_eval],
                 pbar,
                 initial_step,
+                graph_runner,
             )
         else:
             train_and_evaluate(
@@ -610,9 +738,12 @@ def run():
                 None,
                 pbar,
                 initial_step,
+                graph_runner,
             )
         scheduler_g.step()
         scheduler_d.step()
+        if graph_runner is not None:
+            graph_runner.after_lr_schedule()
         if net_dur_disc is not None:
             scheduler_dur_disc.step()
         if net_wd is not None:
@@ -683,6 +814,8 @@ def run():
                 except Exception as e:
                     logger.error(e)
 
+    if graph_runner is not None:
+        logger.info(f"CUDA Graph summary: {graph_runner.summary()}")
     if pbar is not None:
         pbar.close()
 
@@ -701,6 +834,7 @@ def train_and_evaluate(
     writers,
     pbar: tqdm,
     initial_step: int,
+    graph_runner: Optional[GraphedTrainStep] = None,
 ):
     net_g, net_d, net_dur_disc, net_wd, wl = nets
     optim_g, optim_d, optim_dur_disc, optim_wd = optims
@@ -744,6 +878,7 @@ def train_and_evaluate(
         bert,
         style_vec,
     ) in enumerate(train_loader):
+        _perf.before_step()
         # 勾配ノルムはログ用のみ。通常ステップでは計測しないことで、GPU 同期を
         # 発生させない。rank 0 以外はこの値を出力しないため計測不要。
         log_this_step = (
@@ -751,173 +886,221 @@ def train_and_evaluate(
             and global_step % hps.train.log_interval == 0
             and not hps.speedup
         )
-        if net_g.module.use_noise_scaled_mas:
-            current_mas_noise_scale = (
-                net_g.module.mas_noise_scale_initial
-                - net_g.module.noise_scale_delta * global_step
+        if graph_runner is not None:
+            # ---- CUDA Graph 経路 (cuda_graph_step.py): 入力を静的バッファへコピーして graph.replay() ----
+            if net_g.module.use_noise_scaled_mas:
+                mas_noise_scale = max(
+                    net_g.module.mas_noise_scale_initial
+                    - net_g.module.noise_scale_delta * global_step,
+                    0.0,
+                )
+            else:
+                mas_noise_scale = 0.0
+            graph_outs = graph_runner.run(
+                (
+                    x,
+                    x_lengths,
+                    spec,
+                    spec_lengths,
+                    y,
+                    y_lengths,
+                    speakers,
+                    tone,
+                    language,
+                    bert,
+                    style_vec,
+                ),
+                mas_noise_scale,
+                log_this_step,
             )
-            net_g.module.current_mas_noise_scale = max(current_mas_noise_scale, 0.0)
-        x, x_lengths = x.cuda(local_rank, non_blocking=True), x_lengths.cuda(
-            local_rank, non_blocking=True
-        )
-        spec, spec_lengths = spec.cuda(
-            local_rank, non_blocking=True
-        ), spec_lengths.cuda(local_rank, non_blocking=True)
-        y, y_lengths = y.cuda(local_rank, non_blocking=True), y_lengths.cuda(
-            local_rank, non_blocking=True
-        )
-        speakers = speakers.cuda(local_rank, non_blocking=True)
-        tone = tone.cuda(local_rank, non_blocking=True)
-        language = language.cuda(local_rank, non_blocking=True)
-        bert = bert.cuda(local_rank, non_blocking=True)
-        style_vec = style_vec.cuda(local_rank, non_blocking=True)
+            if log_this_step:
+                # ログを出すステップだけ GPU->CPU 同期して値を読む
+                vals = graph_outs.to_floats()
+                loss_disc_all = vals["loss_disc_all"]
+                loss_disc = vals["loss_disc"]
+                loss_gen_all = vals["loss_gen_all"]
+                loss_gen = vals["loss_gen"]
+                loss_fm = vals["loss_fm"]
+                loss_mel = vals["loss_mel"]
+                loss_dur = vals["loss_dur"]
+                loss_kl = vals["loss_kl"]
+                losses_gen = [vals[f"losses_gen.{i}"] for i in range(len(graph_outs.losses_gen))]
+                losses_disc_r = [
+                    vals[f"losses_disc_r.{i}"] for i in range(len(graph_outs.losses_disc_r))
+                ]
+                losses_disc_g = [
+                    vals[f"losses_disc_g.{i}"] for i in range(len(graph_outs.losses_disc_g))
+                ]
+                grad_norm_d = vals["grad_norm_d"]
+                grad_norm_g = vals["grad_norm_g"]
+        else:
+            if net_g.module.use_noise_scaled_mas:
+                current_mas_noise_scale = (
+                    net_g.module.mas_noise_scale_initial
+                    - net_g.module.noise_scale_delta * global_step
+                )
+                net_g.module.current_mas_noise_scale = max(current_mas_noise_scale, 0.0)
+            x, x_lengths = x.cuda(local_rank, non_blocking=True), x_lengths.cuda(
+                local_rank, non_blocking=True
+            )
+            spec, spec_lengths = spec.cuda(
+                local_rank, non_blocking=True
+            ), spec_lengths.cuda(local_rank, non_blocking=True)
+            y, y_lengths = y.cuda(local_rank, non_blocking=True), y_lengths.cuda(
+                local_rank, non_blocking=True
+            )
+            speakers = speakers.cuda(local_rank, non_blocking=True)
+            tone = tone.cuda(local_rank, non_blocking=True)
+            language = language.cuda(local_rank, non_blocking=True)
+            bert = bert.cuda(local_rank, non_blocking=True)
+            style_vec = style_vec.cuda(local_rank, non_blocking=True)
 
-        with autocast(enabled=amp_enabled, dtype=amp_dtype):
-            (
-                y_hat,
-                l_length,
-                attn,
-                ids_slice,
-                x_mask,
-                z_mask,
-                (z, z_p, m_p, logs_p, m_q, logs_q),
-                (hidden_x, logw, logw_),  # , logw_sdp),
-                g,
-            ) = net_g(
-                x,
-                x_lengths,
-                spec,
-                spec_lengths,
-                speakers,
-                tone,
-                language,
-                bert,
-                style_vec,
-            )
-            mel = spec_to_mel_torch(
-                spec,
-                hps.data.filter_length,
-                hps.data.n_mel_channels,
-                hps.data.sampling_rate,
-                hps.data.mel_fmin,
-                hps.data.mel_fmax,
-            )
-            y_mel = commons.slice_segments(
-                mel, ids_slice, hps.train.segment_size // hps.data.hop_length
-            )
-            y_hat_mel = mel_spectrogram_torch(
-                y_hat.squeeze(1).float(),
-                hps.data.filter_length,
-                hps.data.n_mel_channels,
-                hps.data.sampling_rate,
-                hps.data.hop_length,
-                hps.data.win_length,
-                hps.data.mel_fmin,
-                hps.data.mel_fmax,
-            )
-
-            y = commons.slice_segments(
-                y, ids_slice * hps.data.hop_length, hps.train.segment_size
-            )  # slice
-
-            # Discriminator
-            y_d_hat_r, y_d_hat_g, _, _ = net_d(y, y_hat.detach())
             with autocast(enabled=amp_enabled, dtype=amp_dtype):
-                loss_disc, losses_disc_r, losses_disc_g = discriminator_loss(
-                    y_d_hat_r, y_d_hat_g
+                (
+                    y_hat,
+                    l_length,
+                    attn,
+                    ids_slice,
+                    x_mask,
+                    z_mask,
+                    (z, z_p, m_p, logs_p, m_q, logs_q),
+                    (hidden_x, logw, logw_),  # , logw_sdp),
+                    g,
+                ) = net_g(
+                    x,
+                    x_lengths,
+                    spec,
+                    spec_lengths,
+                    speakers,
+                    tone,
+                    language,
+                    bert,
+                    style_vec,
                 )
-                loss_disc_all = loss_disc
-            if net_dur_disc is not None:
-                y_dur_hat_r, y_dur_hat_g = net_dur_disc(
-                    hidden_x.detach(),
-                    x_mask.detach(),
-                    logw_.detach(),
-                    logw.detach(),
-                    g.detach(),
+                mel = spec_to_mel_torch(
+                    spec,
+                    hps.data.filter_length,
+                    hps.data.n_mel_channels,
+                    hps.data.sampling_rate,
+                    hps.data.mel_fmin,
+                    hps.data.mel_fmax,
                 )
-                with autocast(enabled=amp_enabled, dtype=amp_dtype):
-                    # TODO: I think need to mean using the mask, but for now, just mean all
-                    (
-                        loss_dur_disc,
-                        losses_dur_disc_r,
-                        losses_dur_disc_g,
-                    ) = discriminator_loss(y_dur_hat_r, y_dur_hat_g)
-                    loss_dur_disc_all = loss_dur_disc
-                optim_dur_disc.zero_grad()
-                scaler.scale(loss_dur_disc_all).backward()
-                scaler.unscale_(optim_dur_disc)
-                # torch.nn.utils.clip_grad_norm_(
-                # parameters=net_dur_disc.parameters(), max_norm=5
-                # )
-                scaler.step(optim_dur_disc)
-            if net_wd is not None:
-                # logger.debug(f"y.shape: {y.shape}, y_hat.shape: {y_hat.shape}")
-                # shape: (batch, 1, time)
-                with autocast(enabled=amp_enabled, dtype=amp_dtype):
-                    loss_slm = wl.discriminator(
-                        y.detach().squeeze(1), y_hat.detach().squeeze(1)
-                    ).mean()
+                y_mel = commons.slice_segments(
+                    mel, ids_slice, hps.train.segment_size // hps.data.hop_length
+                )
+                y_hat_mel = mel_spectrogram_torch(
+                    y_hat.squeeze(1).float(),
+                    hps.data.filter_length,
+                    hps.data.n_mel_channels,
+                    hps.data.sampling_rate,
+                    hps.data.hop_length,
+                    hps.data.win_length,
+                    hps.data.mel_fmin,
+                    hps.data.mel_fmax,
+                )
 
-                optim_wd.zero_grad()
-                scaler.scale(loss_slm).backward()
-                scaler.unscale_(optim_wd)
-                # torch.nn.utils.clip_grad_norm_(parameters=net_wd.parameters(), max_norm=200)
-                if log_this_step:
-                    grad_norm_wd = commons.clip_grad_value_(
-                        net_wd.parameters(), None
+                y = commons.slice_segments(
+                    y, ids_slice * hps.data.hop_length, hps.train.segment_size
+                )  # slice
+
+                # Discriminator
+                y_d_hat_r, y_d_hat_g, _, _ = net_d(y, y_hat.detach())
+                with autocast(enabled=amp_enabled, dtype=amp_dtype):
+                    loss_disc, losses_disc_r, losses_disc_g = discriminator_loss(
+                        y_d_hat_r, y_d_hat_g
                     )
-                scaler.step(optim_wd)
-
-        optim_d.zero_grad()
-        scaler.scale(loss_disc_all).backward()
-        scaler.unscale_(optim_d)
-        if amp_enabled:
-            # fp16/bf16 いずれの混合精度時も、Discriminatorの勾配爆発対策として norm clipping を適用する。
-            # 特にfp16はbf16よりダイナミックレンジが狭くNaN化しやすいため、この安全策の意味が大きい。
-            torch.nn.utils.clip_grad_norm_(parameters=net_d.parameters(), max_norm=200)
-        if log_this_step:
-            grad_norm_d = commons.clip_grad_value_(net_d.parameters(), None)
-        scaler.step(optim_d)
-
-        with autocast(enabled=amp_enabled, dtype=amp_dtype):
-            # Generator
-            y_d_hat_r, y_d_hat_g, fmap_r, fmap_g = net_d(y, y_hat)
-            if net_dur_disc is not None:
-                _, y_dur_hat_g = net_dur_disc(hidden_x, x_mask, logw_, logw, g)
-            if net_wd is not None:
-                loss_lm = wl(y.detach().squeeze(1), y_hat.squeeze(1)).mean()
-                loss_lm_gen = wl.generator(y_hat.squeeze(1))
-            with autocast(enabled=amp_enabled, dtype=amp_dtype):
-                loss_dur = torch.sum(l_length.float())
-                loss_mel = F.l1_loss(y_mel, y_hat_mel) * hps.train.c_mel
-                loss_kl = kl_loss(z_p, logs_q, m_p, logs_p, z_mask) * hps.train.c_kl
-
-                loss_fm = feature_loss(fmap_r, fmap_g)
-                loss_gen, losses_gen = generator_loss(y_d_hat_g)
-                # loss_commit = loss_commit * hps.train.c_commit
-
-                loss_gen_all = loss_gen + loss_fm + loss_mel + loss_dur + loss_kl
+                    loss_disc_all = loss_disc
                 if net_dur_disc is not None:
-                    loss_dur_gen, losses_dur_gen = generator_loss(y_dur_hat_g)
-                    if net_wd is not None:
-                        loss_gen_all += loss_dur_gen + loss_lm + loss_lm_gen
-                    else:
-                        loss_gen_all += loss_dur_gen
-        optim_g.zero_grad()
-        scaler.scale(loss_gen_all).backward()
-        scaler.unscale_(optim_g)
-        if amp_enabled:
-            # Discriminator側と同様、fp16/bf16 いずれの混合精度時も
-            # Generatorの勾配爆発対策として norm clipping を適用する(fp32時は元の挙動通り適用しない)。
-            torch.nn.utils.clip_grad_norm_(parameters=net_g.parameters(), max_norm=500)
-        if log_this_step:
-            grad_norm_g = commons.clip_grad_value_(net_g.parameters(), None)
-        scaler.step(optim_g)
-        scaler.update()
+                    y_dur_hat_r, y_dur_hat_g = net_dur_disc(
+                        hidden_x.detach(),
+                        x_mask.detach(),
+                        logw_.detach(),
+                        logw.detach(),
+                        g.detach(),
+                    )
+                    with autocast(enabled=amp_enabled, dtype=amp_dtype):
+                        # TODO: I think need to mean using the mask, but for now, just mean all
+                        (
+                            loss_dur_disc,
+                            losses_dur_disc_r,
+                            losses_dur_disc_g,
+                        ) = discriminator_loss(y_dur_hat_r, y_dur_hat_g)
+                        loss_dur_disc_all = loss_dur_disc
+                    optim_dur_disc.zero_grad()
+                    scaler.scale(loss_dur_disc_all).backward()
+                    scaler.unscale_(optim_dur_disc)
+                    # torch.nn.utils.clip_grad_norm_(
+                    # parameters=net_dur_disc.parameters(), max_norm=5
+                    # )
+                    scaler.step(optim_dur_disc)
+                if net_wd is not None:
+                    # logger.debug(f"y.shape: {y.shape}, y_hat.shape: {y_hat.shape}")
+                    # shape: (batch, 1, time)
+                    with autocast(enabled=amp_enabled, dtype=amp_dtype):
+                        loss_slm = wl.discriminator(
+                            y.detach().squeeze(1), y_hat.detach().squeeze(1)
+                        ).mean()
+
+                    optim_wd.zero_grad()
+                    scaler.scale(loss_slm).backward()
+                    scaler.unscale_(optim_wd)
+                    # torch.nn.utils.clip_grad_norm_(parameters=net_wd.parameters(), max_norm=200)
+                    if log_this_step:
+                        grad_norm_wd = commons.clip_grad_value_(
+                            net_wd.parameters(), None
+                        )
+                    scaler.step(optim_wd)
+
+            optim_d.zero_grad()
+            scaler.scale(loss_disc_all).backward()
+            scaler.unscale_(optim_d)
+            if amp_enabled:
+                # fp16/bf16 いずれの混合精度時も、Discriminatorの勾配爆発対策として norm clipping を適用する。
+                # 特にfp16はbf16よりダイナミックレンジが狭くNaN化しやすいため、この安全策の意味が大きい。
+                torch.nn.utils.clip_grad_norm_(parameters=net_d.parameters(), max_norm=200)
+            if log_this_step:
+                grad_norm_d = commons.clip_grad_value_(net_d.parameters(), None)
+            scaler.step(optim_d)
+
+            with autocast(enabled=amp_enabled, dtype=amp_dtype):
+                # Generator
+                y_d_hat_r, y_d_hat_g, fmap_r, fmap_g = net_d(y, y_hat)
+                if net_dur_disc is not None:
+                    _, y_dur_hat_g = net_dur_disc(hidden_x, x_mask, logw_, logw, g)
+                if net_wd is not None:
+                    loss_lm = wl(y.detach().squeeze(1), y_hat.squeeze(1)).mean()
+                    loss_lm_gen = wl.generator(y_hat.squeeze(1))
+                with autocast(enabled=amp_enabled, dtype=amp_dtype):
+                    loss_dur = torch.sum(l_length.float())
+                    loss_mel = F.l1_loss(y_mel, y_hat_mel) * hps.train.c_mel
+                    loss_kl = kl_loss(z_p, logs_q, m_p, logs_p, z_mask) * hps.train.c_kl
+
+                    loss_fm = feature_loss(fmap_r, fmap_g)
+                    loss_gen, losses_gen = generator_loss(y_d_hat_g)
+                    # loss_commit = loss_commit * hps.train.c_commit
+
+                    loss_gen_all = loss_gen + loss_fm + loss_mel + loss_dur + loss_kl
+                    if net_dur_disc is not None:
+                        loss_dur_gen, losses_dur_gen = generator_loss(y_dur_hat_g)
+                        if net_wd is not None:
+                            loss_gen_all += loss_dur_gen + loss_lm + loss_lm_gen
+                        else:
+                            loss_gen_all += loss_dur_gen
+            optim_g.zero_grad()
+            scaler.scale(loss_gen_all).backward()
+            scaler.unscale_(optim_g)
+            if amp_enabled:
+                # Discriminator側と同様、fp16/bf16 いずれの混合精度時も
+                # Generatorの勾配爆発対策として norm clipping を適用する(fp32時は元の挙動通り適用しない)。
+                torch.nn.utils.clip_grad_norm_(parameters=net_g.parameters(), max_norm=500)
+            if log_this_step:
+                grad_norm_g = commons.clip_grad_value_(net_g.parameters(), None)
+            scaler.step(optim_g)
+            scaler.update()
 
         if rank == 0:
             if log_this_step:
-                lr = optim_g.param_groups[0]["lr"]
+                lr = float(optim_g.param_groups[0]["lr"])
                 losses = [loss_disc, loss_gen, loss_fm, loss_mel, loss_dur, loss_kl]
                 # logger.info(
                 #     "Train Epoch: {} [{:.0f}%]".format(
@@ -1072,14 +1255,27 @@ def train_and_evaluate(
                     )
 
         global_step += 1
+        _perf.after_step()
+        if log_this_step:
+            perf_msg = _perf.report()
+            if perf_msg is not None:
+                logger.info(perf_msg)
         if pbar is not None:
             pbar.set_description(
                 f"Epoch {epoch}({100.0 * batch_idx / len(train_loader):.0f}%)/{hps.train.epochs}"
             )
             pbar.update()
 
-    gc.collect()
-    torch.cuda.empty_cache()
+    # 従来は毎エポック gc.collect() + torch.cuda.empty_cache() を実行していた。empty_cache() は
+    # キャッシュ済み GPU メモリを cudaFree し、次の step で cudaMalloc し直すことになる (しかも
+    # デバイス同期を伴う)。1 エポックが 7〜8 step しかない小さいデータセットでは、これが数 step
+    # ごとに起こって step 時間を押し上げるので、「前回から 100 step 以上経っていたら」に間引く
+    # (1 エポックが 100 step 以上のデータセットでは従来どおり毎エポック)。
+    global _last_cleanup_step
+    if global_step - _last_cleanup_step >= 100:
+        gc.collect()
+        torch.cuda.empty_cache()
+        _last_cleanup_step = global_step
     if pbar is None and rank == 0:
         logger.info(f"====> Epoch: {epoch}, step: {global_step}")
 

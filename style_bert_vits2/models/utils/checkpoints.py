@@ -91,6 +91,43 @@ def load_checkpoint(
     return model, optimizer, learning_rate, iteration
 
 
+def portable_optimizer_state_dict(
+    optimizer: Union[torch.optim.Optimizer, torch.optim.AdamW],
+) -> dict[str, Any]:
+    """
+    optimizer.state_dict() を、従来 (capturable=False / lr は float / step は CPU テンソル) と
+    同じ形式で返す。
+
+    CUDA Graph 学習 (cuda_graph_step.py) では AdamW を capturable=True・lr を GPU テンソル・
+    step を GPU テンソルにして動かしている。そのままの state_dict を保存すると、
+    従来の学習コード (eager) で再開したときに capturable=True / テンソル lr が持ち込まれてしまうので、
+    保存時に元の形式へ戻す。通常の optimizer ではそのまま state_dict() を返す。
+    """
+    sd = optimizer.state_dict()
+    needs_conversion = any(
+        isinstance(g.get("lr"), torch.Tensor) or g.get("capturable", False)
+        for g in sd["param_groups"]
+    )
+    if not needs_conversion:
+        return sd
+    param_groups = []
+    for g in sd["param_groups"]:
+        g = dict(g)
+        if isinstance(g.get("lr"), torch.Tensor):
+            g["lr"] = float(g["lr"])
+        if "capturable" in g:
+            g["capturable"] = False
+        param_groups.append(g)
+    state = {}
+    for k, st in sd["state"].items():
+        st = dict(st)
+        step = st.get("step")
+        if isinstance(step, torch.Tensor) and step.device.type != "cpu":
+            st["step"] = step.detach().to("cpu")
+        state[k] = st
+    return {"state": state, "param_groups": param_groups}
+
+
 def save_checkpoint(
     model: torch.nn.Module,
     optimizer: Union[torch.optim.Optimizer, torch.optim.AdamW],
@@ -119,7 +156,7 @@ def save_checkpoint(
         {
             "model": state_dict,
             "iteration": iteration,
-            "optimizer": optimizer.state_dict(),
+            "optimizer": portable_optimizer_state_dict(optimizer),
             "learning_rate": learning_rate,
         },
         checkpoint_path,

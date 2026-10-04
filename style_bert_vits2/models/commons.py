@@ -125,22 +125,35 @@ def subsequent_mask(length: int) -> torch.Tensor:
     return mask
 
 
-@torch.jit.script  # type: ignore
 def fused_add_tanh_sigmoid_multiply(
-    input_a: torch.Tensor, input_b: torch.Tensor, n_channels: torch.Tensor
+    input_a: torch.Tensor,
+    input_b: torch.Tensor,
+    n_channels: Union[int, torch.Tensor, list[int]],
 ) -> torch.Tensor:
     """
     加算、tanh、sigmoid の活性化関数を組み合わせた演算を行う
 
+    元は @torch.jit.script でスクリプト化されていたが、
+      - WN.forward が毎回 CPU 上に torch.IntTensor を作って渡していた
+      - 実行中に TorchScript のプロファイリング/融合(NNC)が走り、CUDA Graph キャプチャ中に
+        カーネルの JIT コンパイルが起きうる
+    ため、通常の Python 関数にした (演算内容は同一)。
+
     Args:
         input_a (torch.Tensor): 入力テンソル A
         input_b (torch.Tensor): 入力テンソル B
-        n_channels (torch.Tensor): チャネル数
+        n_channels (int | torch.Tensor | list[int]): チャネル数
+            (旧実装との互換のため、要素 0 がチャネル数のテンソル/リストも受け付ける)
 
     Returns:
         torch.Tensor: 演算結果
     """
-    n_channels_int = n_channels[0]
+    if isinstance(n_channels, int):
+        n_channels_int = n_channels
+    elif isinstance(n_channels, torch.Tensor):
+        n_channels_int = int(n_channels.reshape(-1)[0])
+    else:
+        n_channels_int = int(n_channels[0])
     in_act = input_a + input_b
     t_act = torch.tanh(in_act[:, :n_channels_int, :])
     s_act = torch.sigmoid(in_act[:, n_channels_int:, :])
@@ -229,3 +242,30 @@ def clip_grad_value_(
         torch._foreach_clamp_max_(grads, clip_value)
 
     return total_norm.item()
+
+
+def grad_total_norm(
+    parameters: Union[torch.Tensor, Iterable[torch.Tensor]],
+    norm_type: float = 2.0,
+) -> torch.Tensor:
+    """
+    `clip_grad_value_(parameters, None)` と同じ「勾配の総ノルム」を、Python float ではなく
+    GPU 上のテンソルのまま返す (.item() を呼ばないので GPU 同期が起きず、CUDA Graph の
+    キャプチャ内でも使える)。ログ出力時にだけ呼び出し側で .item() / TensorBoard へ渡す。
+
+    Args:
+        parameters: 勾配を持つパラメータ
+        norm_type (float): ノルムの種類
+
+    Returns:
+        torch.Tensor: 総ノルム (0 次元テンソル)
+    """
+    if isinstance(parameters, torch.Tensor):
+        parameters = [parameters]
+    params = list(parameters)
+    grads = [p.grad for p in params if p.grad is not None]
+    if not grads:
+        # 勾配が 1 つも無いとき (全パラメータ凍結など)。パラメータと同じデバイスに 0 を返す
+        return torch.zeros((), device=params[0].device if params else "cpu")
+    grad_norms = torch._foreach_norm(grads, float(norm_type))
+    return torch.linalg.vector_norm(torch.stack(grad_norms), float(norm_type))
