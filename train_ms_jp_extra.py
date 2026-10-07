@@ -3,6 +3,7 @@ import datetime
 import gc
 import os
 import platform
+from types import MethodType
 
 import torch
 import torch.distributed as dist
@@ -27,6 +28,7 @@ from losses import WavLMLoss, discriminator_loss, feature_loss, generator_loss, 
 from mel_processing import mel_spectrogram_torch, spec_to_mel_torch
 from style_bert_vits2.logging import logger
 from style_bert_vits2.models import commons, utils
+from style_bert_vits2.models.attentions import MultiHeadAttention
 from style_bert_vits2.models.hyper_parameters import HyperParameters
 from style_bert_vits2.models.models_jp_extra import (
     DurationDiscriminator,
@@ -54,6 +56,95 @@ config = get_config()
 global_step = 0
 
 api = HfApi()
+
+
+class _CompactRelativeToAbsolute(torch.autograd.Function):
+    """Scatter only the learned relative offsets, without a (2*T-1) padding."""
+
+    @staticmethod
+    def forward(ctx, x):
+        length, width = x.shape[-2:]
+        window = width // 2
+        ctx.length, ctx.window = length, window
+        out = x.new_zeros(*x.shape[:-1], length)
+        for offset in range(-window, window + 1):
+            start, end = max(-offset, 0), min(length, length - offset)
+            out.diagonal(offset, dim1=-2, dim2=-1).copy_(
+                x[..., start:end, offset + window]
+            )
+        return out
+
+    @staticmethod
+    def backward(ctx, grad):
+        length, window = ctx.length, ctx.window
+        out = grad.new_zeros(*grad.shape[:-1], 2 * window + 1)
+        for offset in range(-window, window + 1):
+            start, end = max(-offset, 0), min(length, length - offset)
+            out[..., start:end, offset + window].copy_(
+                grad.diagonal(offset, dim1=-2, dim2=-1)
+            )
+        return out
+
+
+class _CompactAbsoluteToRelative(torch.autograd.Function):
+    """Gather the local diagonals used by relative values, including gradients."""
+
+    @staticmethod
+    def forward(ctx, x, window):
+        ctx.length, ctx.window = x.shape[-1], window
+        out = x.new_zeros(*x.shape[:-1], 2 * window + 1)
+        for offset in range(-window, window + 1):
+            start, end = max(-offset, 0), min(ctx.length, ctx.length - offset)
+            out[..., start:end, offset + window].copy_(
+                x.diagonal(offset, dim1=-2, dim2=-1)
+            )
+        return out
+
+    @staticmethod
+    def backward(ctx, grad):
+        length, window = ctx.length, ctx.window
+        out = grad.new_zeros(*grad.shape[:-1], length)
+        for offset in range(-window, window + 1):
+            start, end = max(-offset, 0), min(length, length - offset)
+            out.diagonal(offset, dim1=-2, dim2=-1).copy_(
+                grad[..., start:end, offset + window]
+            )
+        return out, None
+
+
+def _compact_relative_embeddings(module, embeddings, length):
+    window = min(module.window_size, length - 1)
+    return embeddings[:, module.window_size - window:module.window_size + window + 1]
+
+
+def _compact_relative_to_absolute(module, x):
+    return _CompactRelativeToAbsolute.apply(x)
+
+
+def _compact_absolute_to_relative(module, x):
+    return _CompactAbsoluteToRelative.apply(x, min(module.window_size, x.shape[-1] - 1))
+
+
+def _release_attention_reference(module, inputs, output):
+    # The training graph retains what backward needs. No training code reads this
+    # diagnostic attribute; keeping it also holds the previous batch's matrices.
+    module.attn = None
+
+
+def _install_compact_relative_attention(net):
+    count = 0
+    for module in net.modules():
+        if isinstance(module, MultiHeadAttention) and module.window_size is not None:
+            module._get_relative_embeddings = MethodType(_compact_relative_embeddings, module)
+            module._relative_position_to_absolute_position = MethodType(
+                _compact_relative_to_absolute, module
+            )
+            module._absolute_position_to_relative_position = MethodType(
+                _compact_absolute_to_relative, module
+            )
+            module.register_forward_hook(_release_attention_reference)
+            count += 1
+    return count
 
 
 def run():
@@ -93,6 +184,11 @@ def run():
         "--speedup",
         action="store_true",
         help="Speed up training by disabling logging and evaluation.",
+    )
+    parser.add_argument(
+        "--disable_bf16_optimizations",
+        action="store_true",
+        help="Use the original relative-position implementation for comparison.",
     )
     parser.add_argument(
         "--repo_id",
@@ -347,6 +443,9 @@ def run():
         gin_channels=hps.model.gin_channels,
         slm=hps.model.slm,
     ).cuda(local_rank)
+    if hps.train.bf16_run and not args.disable_bf16_optimizations:
+        count = _install_compact_relative_attention(net_g)
+        logger.info(f"BF16 compact relative attention enabled: {count} layers")
     if getattr(hps.train, "freeze_JP_bert", False):
         logger.info("Freezing (JP) bert encoder !!!")
         for param in net_g.enc_p.bert_proj.parameters():
@@ -551,17 +650,17 @@ def run():
         wl = None
     if hps.train.fp16_run and hps.train.bf16_run:
         logger.warning(
-            "Both fp16_run and bf16_run are set to True in config.json; fp16_run takes precedence."
+            "Both fp16_run and bf16_run are set to True in config.json; bf16_run takes precedence."
         )
-    if hps.train.fp16_run:
-        logger.info("Mixed precision training: fp16 (GradScaler enabled)")
-    elif hps.train.bf16_run:
+    if hps.train.bf16_run:
         logger.info("Mixed precision training: bf16")
+    elif hps.train.fp16_run:
+        logger.info("Mixed precision training: fp16 (GradScaler enabled)")
     else:
         logger.info("Mixed precision training: disabled (fp32)")
     # GradScaler は fp16 の勾配アンダーフロー対策としてのみ必要。
     # bf16 は fp32 相当の指数レンジを持つため scaler は不要 (enabled=False で問題ない)。
-    scaler = GradScaler(enabled=hps.train.fp16_run)
+    scaler = GradScaler(enabled=hps.train.fp16_run and not hps.train.bf16_run)
     logger.info("Start training.")
 
     diff = abs(
