@@ -27,6 +27,7 @@ from losses import WavLMLoss, discriminator_loss, feature_loss, generator_loss, 
 from mel_processing import mel_spectrogram_torch, spec_to_mel_torch
 from style_bert_vits2.logging import logger
 from style_bert_vits2.models import commons, utils
+from style_bert_vits2.models.compact_relative import patch_generator
 from style_bert_vits2.models.hyper_parameters import HyperParameters
 from style_bert_vits2.models.models_jp_extra import (
     DurationDiscriminator,
@@ -103,6 +104,11 @@ def run():
         "--not_use_custom_batch_sampler",
         help="Don't use custom batch sampler for training, which was used in the version < 2.5",
         action="store_true",
+    )
+    parser.add_argument(
+        "--disable_bf16_optimizations",
+        action="store_true",
+        help="Use the original relative-position attention arithmetic for comparison.",
     )
     args = parser.parse_args()
 
@@ -361,6 +367,12 @@ def run():
         for param in net_g.dec.parameters():
             param.requires_grad = False
 
+    if hps.train.bf16_run and not args.disable_bf16_optimizations:
+        relative_patch = patch_generator(net_g)
+        logger.info(
+            f"BF16 compact relative attention enabled: {relative_patch.metadata['count']} layers"
+        )
+
     net_d = MultiPeriodDiscriminator(hps.model.use_spectral_norm).cuda(local_rank)
     optim_g = torch.optim.AdamW(
         filter(lambda p: p.requires_grad, net_g.parameters()),
@@ -551,17 +563,17 @@ def run():
         wl = None
     if hps.train.fp16_run and hps.train.bf16_run:
         logger.warning(
-            "Both fp16_run and bf16_run are set to True in config.json; fp16_run takes precedence."
+            "Both fp16_run and bf16_run are set to True in config.json; bf16_run takes precedence."
         )
-    if hps.train.fp16_run:
-        logger.info("Mixed precision training: fp16 (GradScaler enabled)")
-    elif hps.train.bf16_run:
+    if hps.train.bf16_run:
         logger.info("Mixed precision training: bf16")
+    elif hps.train.fp16_run:
+        logger.info("Mixed precision training: fp16 (GradScaler enabled)")
     else:
         logger.info("Mixed precision training: disabled (fp32)")
     # GradScaler は fp16 の勾配アンダーフロー対策としてのみ必要。
     # bf16 は fp32 相当の指数レンジを持つため scaler は不要 (enabled=False で問題ない)。
-    scaler = GradScaler(enabled=hps.train.fp16_run)
+    scaler = GradScaler(enabled=hps.train.fp16_run and not hps.train.bf16_run)
     logger.info("Start training.")
 
     diff = abs(
