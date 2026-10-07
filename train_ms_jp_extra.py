@@ -3,9 +3,12 @@ import datetime
 import gc
 import os
 import platform
+from contextlib import contextmanager
+from types import MethodType
 
 import torch
 import torch.distributed as dist
+from torch import nn
 from huggingface_hub import HfApi
 from torch.cuda.amp import GradScaler, autocast
 from torch.nn import functional as F
@@ -27,7 +30,7 @@ from losses import WavLMLoss, discriminator_loss, feature_loss, generator_loss, 
 from mel_processing import mel_spectrogram_torch, spec_to_mel_torch
 from style_bert_vits2.logging import logger
 from style_bert_vits2.models import commons, utils
-from style_bert_vits2.models.compact_relative import patch_generator
+from style_bert_vits2.models.attentions import MultiHeadAttention
 from style_bert_vits2.models.hyper_parameters import HyperParameters
 from style_bert_vits2.models.models_jp_extra import (
     DurationDiscriminator,
@@ -55,6 +58,140 @@ config = get_config()
 global_step = 0
 
 api = HfApi()
+
+
+class _CompactRelativeToAbsolute(torch.autograd.Function):
+    """Scatter only the learned relative offsets, without a (2*T-1) padding."""
+
+    @staticmethod
+    def forward(ctx, x):
+        length, width = x.shape[-2:]
+        window = width // 2
+        ctx.length, ctx.window = length, window
+        out = x.new_zeros(*x.shape[:-1], length)
+        for offset in range(-window, window + 1):
+            start, end = max(-offset, 0), min(length, length - offset)
+            out.diagonal(offset, dim1=-2, dim2=-1).copy_(
+                x[..., start:end, offset + window]
+            )
+        return out
+
+    @staticmethod
+    def backward(ctx, grad):
+        length, window = ctx.length, ctx.window
+        out = grad.new_zeros(*grad.shape[:-1], 2 * window + 1)
+        for offset in range(-window, window + 1):
+            start, end = max(-offset, 0), min(length, length - offset)
+            out[..., start:end, offset + window].copy_(
+                grad.diagonal(offset, dim1=-2, dim2=-1)
+            )
+        return out
+
+class _CompactAbsoluteToRelative(torch.autograd.Function):
+    """Gather the local diagonals used by relative values, including gradients."""
+
+    @staticmethod
+    def forward(ctx, x, window):
+        ctx.length, ctx.window = x.shape[-1], window
+        out = x.new_zeros(*x.shape[:-1], 2 * window + 1)
+        for offset in range(-window, window + 1):
+            start, end = max(-offset, 0), min(ctx.length, ctx.length - offset)
+            out[..., start:end, offset + window].copy_(
+                x.diagonal(offset, dim1=-2, dim2=-1)
+            )
+        return out
+
+    @staticmethod
+    def backward(ctx, grad):
+        length, window = ctx.length, ctx.window
+        out = grad.new_zeros(*grad.shape[:-1], length)
+        for offset in range(-window, window + 1):
+            start, end = max(-offset, 0), min(length, length - offset)
+            out.diagonal(offset, dim1=-2, dim2=-1).copy_(
+                grad[..., start:end, offset + window]
+            )
+        return out, None
+
+def _compact_relative_embeddings(module, embeddings, length):
+    window = min(module.window_size, length - 1)
+    return embeddings[:, module.window_size - window:module.window_size + window + 1]
+
+def _compact_relative_to_absolute(module, x):
+    return _CompactRelativeToAbsolute.apply(x)
+
+def _compact_absolute_to_relative(module, x):
+    return _CompactAbsoluteToRelative.apply(x, min(module.window_size, x.shape[-1] - 1))
+
+def _release_attention_reference(module, inputs, output):
+    # The training graph retains what backward needs. No training code reads this
+    # diagnostic attribute; keeping it also holds the previous batch's matrices.
+    module.attn = None
+
+def _install_compact_relative_attention(net):
+    count = 0
+    for module in net.modules():
+        if isinstance(module, MultiHeadAttention) and module.window_size is not None:
+            module._get_relative_embeddings = MethodType(_compact_relative_embeddings, module)
+            module._relative_position_to_absolute_position = MethodType(
+                _compact_relative_to_absolute, module
+            )
+            module._absolute_position_to_relative_position = MethodType(
+                _compact_absolute_to_relative, module
+            )
+            module.register_forward_hook(_release_attention_reference)
+            count += 1
+    return count
+
+def can_freeze_discriminator_for_generator(
+    discriminator, *, use_spectral_norm, duration_discriminator=None,
+    wavlm_discriminator=None, world_size=None,
+):
+    """Return false for configurations outside the numerically validated scope."""
+    if use_spectral_norm or duration_discriminator is not None or wavlm_discriminator is not None:
+        return False
+    if world_size is not None and int(world_size) != 1:
+        return False
+    if torch.distributed.is_initialized() and torch.distributed.get_world_size() != 1:
+        return False
+    if isinstance(discriminator, nn.DataParallel):
+        return False
+    if isinstance(discriminator, nn.parallel.DistributedDataParallel):
+        if torch.distributed.get_world_size(discriminator.process_group) != 1:
+            return False
+        discriminator = discriminator.module
+    # Check the actual legacy spectral-norm buffers as well as the config flag.
+    return not any("weight_u" in module._buffers for module in discriminator.modules())
+
+@contextmanager
+def generator_discriminator_pass(
+    discriminator, *, enabled=True, use_spectral_norm=False,
+    duration_discriminator=None, wavlm_discriminator=None, world_size=None,
+):
+    """Yield the D call for G and restore every original flag on all exits.
+
+    The caller must include the G loss backward in this context. At one DDP
+    rank, the underlying module keeps the derivative with respect to generated
+    audio without asking DDP to prepare an unused D parameter reduction.
+    Unsupported configurations retain the normal discriminator call.
+    """
+    allowed = enabled and can_freeze_discriminator_for_generator(
+        discriminator, use_spectral_norm=use_spectral_norm,
+        duration_discriminator=duration_discriminator,
+        wavlm_discriminator=wavlm_discriminator, world_size=world_size,
+    )
+    if not allowed:
+        yield discriminator
+        return
+    module = discriminator.module if isinstance(discriminator, nn.parallel.DistributedDataParallel) else discriminator
+    parameters = tuple(module.parameters())
+    flags = tuple(parameter.requires_grad for parameter in parameters)
+    try:
+        for parameter in parameters:
+            parameter.requires_grad_(False)
+        yield module
+    finally:
+        for parameter, flag in zip(parameters, flags):
+            parameter.requires_grad_(flag)
 
 
 def run():
@@ -368,9 +505,9 @@ def run():
             param.requires_grad = False
 
     if hps.train.bf16_run and not args.disable_bf16_optimizations:
-        relative_patch = patch_generator(net_g)
+        relative_count = _install_compact_relative_attention(net_g)
         logger.info(
-            f"BF16 compact relative attention enabled: {relative_patch.metadata['count']} layers"
+            f"BF16 compact relative attention enabled: {relative_count} layers"
         )
 
     net_d = MultiPeriodDiscriminator(hps.model.use_spectral_norm).cuda(local_rank)
@@ -426,6 +563,18 @@ def run():
             device_ids=[local_rank],
             #  bucket_cap_mb=512
         )
+
+    net_d._sbv2_freeze_for_generator = (
+        hps.train.bf16_run
+        and not args.disable_bf16_optimizations
+        and can_freeze_discriminator_for_generator(
+            net_d, use_spectral_norm=hps.model.use_spectral_norm,
+            duration_discriminator=net_dur_disc, wavlm_discriminator=net_wd,
+            world_size=n_gpus,
+        )
+    )
+    if net_d._sbv2_freeze_for_generator:
+        logger.info("Generator update: skip unused discriminator parameter gradients")
 
     if utils.is_resuming(model_dir):
         if net_dur_disc is not None:
@@ -891,40 +1040,45 @@ def train_and_evaluate(
             grad_norm_d = commons.clip_grad_value_(net_d.parameters(), None)
         scaler.step(optim_d)
 
-        with autocast(enabled=amp_enabled, dtype=amp_dtype):
-            # Generator
-            y_d_hat_r, y_d_hat_g, fmap_r, fmap_g = net_d(y, y_hat)
-            if net_dur_disc is not None:
-                _, y_dur_hat_g = net_dur_disc(hidden_x, x_mask, logw_, logw, g)
-            if net_wd is not None:
-                loss_lm = wl(y.detach().squeeze(1), y_hat.squeeze(1)).mean()
-                loss_lm_gen = wl.generator(y_hat.squeeze(1))
+        with generator_discriminator_pass(
+            net_d, enabled=net_d._sbv2_freeze_for_generator,
+            use_spectral_norm=hps.model.use_spectral_norm,
+            duration_discriminator=net_dur_disc, wavlm_discriminator=net_wd,
+        ) as g_discriminator:
             with autocast(enabled=amp_enabled, dtype=amp_dtype):
-                loss_dur = torch.sum(l_length.float())
-                loss_mel = F.l1_loss(y_mel, y_hat_mel) * hps.train.c_mel
-                loss_kl = kl_loss(z_p, logs_q, m_p, logs_p, z_mask) * hps.train.c_kl
-
-                loss_fm = feature_loss(fmap_r, fmap_g)
-                loss_gen, losses_gen = generator_loss(y_d_hat_g)
-                # loss_commit = loss_commit * hps.train.c_commit
-
-                loss_gen_all = loss_gen + loss_fm + loss_mel + loss_dur + loss_kl
+                # Generator
+                y_d_hat_r, y_d_hat_g, fmap_r, fmap_g = g_discriminator(y, y_hat)
                 if net_dur_disc is not None:
-                    loss_dur_gen, losses_dur_gen = generator_loss(y_dur_hat_g)
-                    if net_wd is not None:
-                        loss_gen_all += loss_dur_gen + loss_lm + loss_lm_gen
-                    else:
-                        loss_gen_all += loss_dur_gen
-        optim_g.zero_grad()
-        scaler.scale(loss_gen_all).backward()
-        scaler.unscale_(optim_g)
-        if amp_enabled:
-            # Discriminator側と同様、fp16/bf16 いずれの混合精度時も
-            # Generatorの勾配爆発対策として norm clipping を適用する(fp32時は元の挙動通り適用しない)。
-            torch.nn.utils.clip_grad_norm_(parameters=net_g.parameters(), max_norm=500)
-        if log_this_step:
-            grad_norm_g = commons.clip_grad_value_(net_g.parameters(), None)
-        scaler.step(optim_g)
+                    _, y_dur_hat_g = net_dur_disc(hidden_x, x_mask, logw_, logw, g)
+                if net_wd is not None:
+                    loss_lm = wl(y.detach().squeeze(1), y_hat.squeeze(1)).mean()
+                    loss_lm_gen = wl.generator(y_hat.squeeze(1))
+                with autocast(enabled=amp_enabled, dtype=amp_dtype):
+                    loss_dur = torch.sum(l_length.float())
+                    loss_mel = F.l1_loss(y_mel, y_hat_mel) * hps.train.c_mel
+                    loss_kl = kl_loss(z_p, logs_q, m_p, logs_p, z_mask) * hps.train.c_kl
+
+                    loss_fm = feature_loss(fmap_r, fmap_g)
+                    loss_gen, losses_gen = generator_loss(y_d_hat_g)
+                    # loss_commit = loss_commit * hps.train.c_commit
+
+                    loss_gen_all = loss_gen + loss_fm + loss_mel + loss_dur + loss_kl
+                    if net_dur_disc is not None:
+                        loss_dur_gen, losses_dur_gen = generator_loss(y_dur_hat_g)
+                        if net_wd is not None:
+                            loss_gen_all += loss_dur_gen + loss_lm + loss_lm_gen
+                        else:
+                            loss_gen_all += loss_dur_gen
+            optim_g.zero_grad()
+            scaler.scale(loss_gen_all).backward()
+            scaler.unscale_(optim_g)
+            if amp_enabled:
+                # Discriminator側と同様、fp16/bf16 いずれの混合精度時も
+                # Generatorの勾配爆発対策として norm clipping を適用する(fp32時は元の挙動通り適用しない)。
+                torch.nn.utils.clip_grad_norm_(parameters=net_g.parameters(), max_norm=500)
+            if log_this_step:
+                grad_norm_g = commons.clip_grad_value_(net_g.parameters(), None)
+            scaler.step(optim_g)
         scaler.update()
 
         if rank == 0:
