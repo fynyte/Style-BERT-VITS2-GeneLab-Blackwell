@@ -260,6 +260,10 @@ def run():
         help="Compile the shared dense training spline (Linux/CUDA with Triton; first step includes compilation).",
     )
     args = parser.parse_args()
+    # CLI-only options must stay outside the strict Pydantic config model.
+    algorithm_optimizations = not args.disable_algorithm_optimizations
+    if args.compile_spline and not algorithm_optimizations:
+        parser.error("--compile_spline requires algorithm optimizations")
 
     # Set log file
     model_dir = os.path.join(args.model, config.train_ms_config.model_dir)
@@ -298,9 +302,6 @@ def run():
     # This is needed because we have to pass values to `train_and_evaluate()
     hps.model_dir = model_dir
     hps.speedup = args.speedup
-    hps.algorithm_optimizations = not args.disable_algorithm_optimizations
-    if args.compile_spline and not hps.algorithm_optimizations:
-        parser.error("--compile_spline requires algorithm optimizations")
     hps.repo_id = args.repo_id
 
     # 比较路径是否相同
@@ -523,7 +524,7 @@ def run():
         relative_count = _install_compact_relative_attention(net_g)
         logger.info(f"BF16 compact relative attention enabled: {relative_count} layers")
 
-    if hps.algorithm_optimizations:
+    if algorithm_optimizations:
         net_g.use_gather_prior = True
         spline_transform = (
             torch.compile(
@@ -788,6 +789,7 @@ def run():
                 [writer, writer_eval],
                 pbar,
                 initial_step,
+                algorithm_optimizations=algorithm_optimizations,
             )
         else:
             train_and_evaluate(
@@ -804,6 +806,7 @@ def run():
                 None,
                 pbar,
                 initial_step,
+                algorithm_optimizations=algorithm_optimizations,
             )
         scheduler_g.step()
         scheduler_d.step()
@@ -895,6 +898,8 @@ def train_and_evaluate(
     writers,
     pbar: tqdm,
     initial_step: int,
+    *,
+    algorithm_optimizations: bool = True,
 ):
     net_g, net_d, net_dur_disc, net_wd, wl = nets
     optim_g, optim_d, optim_dur_disc, optim_wd = optims
@@ -991,7 +996,7 @@ def train_and_evaluate(
             segment_frames = hps.train.segment_size // hps.data.hop_length
             mel_input = (
                 commons.slice_segments(spec, ids_slice, segment_frames)
-                if hps.algorithm_optimizations
+                if algorithm_optimizations
                 else spec
             )
             mel = spec_to_mel_torch(
@@ -1004,7 +1009,7 @@ def train_and_evaluate(
             )
             y_mel = (
                 mel
-                if hps.algorithm_optimizations
+                if algorithm_optimizations
                 else commons.slice_segments(mel, ids_slice, segment_frames)
             )
             y_hat_mel = mel_spectrogram_torch(
@@ -1018,7 +1023,7 @@ def train_and_evaluate(
                 hps.data.mel_fmax,
                 # The decoder's final tanh guarantees this range. Avoid two
                 # host synchronizations checking an invariant of y_hat.
-                check_range=not hps.algorithm_optimizations,
+                check_range=not algorithm_optimizations,
             )
 
             y = commons.slice_segments(
@@ -1061,7 +1066,7 @@ def train_and_evaluate(
                 # shape: (batch, 1, time)
                 with autocast(enabled=amp_enabled, dtype=amp_dtype):
                     if (
-                        hps.algorithm_optimizations
+                        algorithm_optimizations
                         and wl.can_share_embeddings()
                         and (net_dur_disc is not None or log_this_step)
                     ):
@@ -1110,7 +1115,7 @@ def train_and_evaluate(
                     # The existing objective includes these losses only when
                     # the duration discriminator is enabled. Otherwise they
                     # are diagnostics and are needed only on logging steps.
-                    if hps.algorithm_optimizations:
+                    if algorithm_optimizations:
                         if net_dur_disc is not None:
                             loss_lm, loss_lm_gen = wl.generator_losses(
                                 y.detach().squeeze(1),
