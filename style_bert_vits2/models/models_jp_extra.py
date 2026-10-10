@@ -1136,8 +1136,11 @@ class SynthesizerTrn(nn.Module):
         l_length = l_length_dp + l_length_sdp
 
         # expand prior
-        m_p = torch.matmul(attn.squeeze(1), m_p.transpose(1, 2)).transpose(1, 2)
-        logs_p = torch.matmul(attn.squeeze(1), logs_p.transpose(1, 2)).transpose(1, 2)
+        if getattr(self, "use_gather_prior", False):
+            m_p, logs_p = commons.expand_prior(attn.squeeze(1), m_p, logs_p)
+        else:
+            m_p = torch.matmul(attn.squeeze(1), m_p.transpose(1, 2)).transpose(1, 2)
+            logs_p = torch.matmul(attn.squeeze(1), logs_p.transpose(1, 2)).transpose(1, 2)
 
         z_slice, ids_slice = commons.rand_slice_segments(
             z, y_lengths, self.segment_size

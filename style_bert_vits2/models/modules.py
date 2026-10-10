@@ -553,7 +553,14 @@ class ConvFlow(nn.Module):
         )
         unnormalized_derivatives = h[..., 2 * self.num_bins :]
 
-        x1, logabsdet = piecewise_rational_quadratic_transform(
+        # Compile only the training direction. Reverse splines retain their
+        # validation checks and the ordinary inference implementation.
+        spline_transform = (
+            getattr(self, "spline_transform", piecewise_rational_quadratic_transform)
+            if not reverse
+            else piecewise_rational_quadratic_transform
+        )
+        x1, logabsdet = spline_transform(
             x1,
             unnormalized_widths,
             unnormalized_heights,
@@ -561,6 +568,7 @@ class ConvFlow(nn.Module):
             inverse=reverse,
             tails="linear",
             tail_bound=self.tail_bound,
+            use_dense=getattr(self, "use_dense_spline", False),
         )
 
         x = torch.cat([x0, x1], 1) * x_mask

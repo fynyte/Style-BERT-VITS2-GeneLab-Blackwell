@@ -80,6 +80,44 @@ class WavLMLoss(torch.nn.Module):
         for param in self.wavlm.parameters():
             param.requires_grad = False
 
+    def can_share_embeddings(self):
+        """Sharing is equivalent only for a frozen, deterministic extractor."""
+        return not self.wavlm.training and not any(
+            param.requires_grad for param in self.wavlm.parameters()
+        )
+
+    def _hidden_states(self, wav):
+        return self.wavlm(
+            input_values=self.resample(wav), output_hidden_states=True
+        ).hidden_states
+
+    @staticmethod
+    def _discriminator_input(embeddings):
+        return (
+            torch.stack(embeddings, dim=1)
+            .transpose(-1, -2)
+            .flatten(start_dim=1, end_dim=2)
+        )
+
+    def generator_losses(self, wav, y_rec, *, wav_embeddings=None):
+        """Compute both G losses from one differentiable WavLM forward.
+
+        The optional real embeddings belong to this batch's D pass. Never cache
+        the generated embeddings across D/G: G needs a fresh autograd graph.
+        """
+        if not self.can_share_embeddings():
+            return self(wav, y_rec), self.generator(y_rec)
+        if wav_embeddings is None:
+            with torch.no_grad():
+                wav_embeddings = self._hidden_states(wav)
+        y_rec_embeddings = self._hidden_states(y_rec)
+        feature = sum(
+            torch.mean(torch.abs(er.detach() - eg))
+            for er, eg in zip(wav_embeddings, y_rec_embeddings)
+        )
+        prediction = self.wd(self._discriminator_input(y_rec_embeddings))
+        return feature.mean(), torch.mean((1 - prediction) ** 2)
+
     def forward(self, wav, y_rec):
         with torch.no_grad():
             wav_16 = self.resample(wav)
@@ -112,7 +150,7 @@ class WavLMLoss(torch.nn.Module):
 
         return loss_gen
 
-    def discriminator(self, wav, y_rec):
+    def discriminator(self, wav, y_rec, *, return_real_embeddings=False):
         with torch.no_grad():
             wav_16 = self.resample(wav)
             wav_embeddings = self.wavlm(
@@ -144,7 +182,10 @@ class WavLMLoss(torch.nn.Module):
 
         loss_disc_f = r_loss + g_loss
 
-        return loss_disc_f.mean()
+        loss = loss_disc_f.mean()
+        if return_real_embeddings:
+            return loss, wav_embeddings
+        return loss
 
     def discriminator_forward(self, wav):
         with torch.no_grad():

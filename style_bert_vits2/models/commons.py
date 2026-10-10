@@ -82,10 +82,35 @@ def slice_segments(
     Returns:
         torch.Tensor: スライスされたセグメント
     """
-    gather_indices = ids_str.view(x.size(0), 1, 1).repeat(
-        1, x.size(1), 1
-    ) + torch.arange(segment_size, device=x.device)
+    gather_indices = (
+        ids_str.view(x.size(0), 1, 1) + torch.arange(segment_size, device=x.device)
+    ).expand(-1, x.size(1), -1)
     return torch.gather(x, 2, gather_indices)
+
+
+def expand_prior(
+    attn: torch.Tensor, m_p: torch.Tensor, logs_p: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Expand a hard alignment without two dense matrix multiplications.
+
+    MAS selects exactly one text position per valid acoustic frame. Padded
+    frames have no selection, so explicitly zero those gathered values.
+    """
+    # bmm is an autocast operation whereas gather is not. Match the original
+    # output precision even when masking has promoted the encoder stats to FP32.
+    if m_p.is_cuda and torch.is_autocast_enabled():
+        dtype = torch.get_autocast_gpu_dtype()
+        if m_p.dtype != torch.float64:
+            m_p = m_p.to(dtype)
+        if logs_p.dtype != torch.float64:
+            logs_p = logs_p.to(dtype)
+    indices = attn.argmax(dim=-1).unsqueeze(1)
+    valid = attn.sum(dim=-1).unsqueeze(1)
+    indices = indices.expand(-1, m_p.size(1), -1)
+    return (
+        torch.gather(m_p, 2, indices) * valid.to(m_p.dtype),
+        torch.gather(logs_p, 2, indices) * valid.to(logs_p.dtype),
+    )
 
 
 def rand_slice_segments(

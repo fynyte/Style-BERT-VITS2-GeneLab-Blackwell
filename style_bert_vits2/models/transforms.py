@@ -4,7 +4,6 @@ import numpy as np
 import torch
 from torch.nn import functional as F
 
-
 DEFAULT_MIN_BIN_WIDTH = 1e-3
 DEFAULT_MIN_BIN_HEIGHT = 1e-3
 DEFAULT_MIN_DERIVATIVE = 1e-3
@@ -21,6 +20,7 @@ def piecewise_rational_quadratic_transform(
     min_bin_width: float = DEFAULT_MIN_BIN_WIDTH,
     min_bin_height: float = DEFAULT_MIN_BIN_HEIGHT,
     min_derivative: float = DEFAULT_MIN_DERIVATIVE,
+    use_dense: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
 
     if tails is None:
@@ -28,7 +28,11 @@ def piecewise_rational_quadratic_transform(
         spline_kwargs = {}
     else:
         spline_fn = unconstrained_rational_quadratic_spline
-        spline_kwargs = {"tails": tails, "tail_bound": tail_bound}
+        spline_kwargs = {
+            "tails": tails,
+            "tail_bound": tail_bound,
+            "use_dense": use_dense,
+        }
 
     outputs, logabsdet = spline_fn(
         inputs=inputs,
@@ -48,7 +52,11 @@ def searchsorted(
     bin_locations: torch.Tensor, inputs: torch.Tensor, eps: float = 1e-6
 ) -> torch.Tensor:
     bin_locations[..., -1] += eps
-    return torch.sum(inputs[..., None] >= bin_locations, dim=-1) - 1
+    # In FP16/BF16, eps may round away at the right endpoint. The closed
+    # interval still belongs to the last bin, not the nonexistent next bin.
+    return (torch.sum(inputs[..., None] >= bin_locations, dim=-1) - 1).clamp_max(
+        bin_locations.size(-1) - 2
+    )
 
 
 def unconstrained_rational_quadratic_spline(
@@ -62,6 +70,7 @@ def unconstrained_rational_quadratic_spline(
     min_bin_width: float = DEFAULT_MIN_BIN_WIDTH,
     min_bin_height: float = DEFAULT_MIN_BIN_HEIGHT,
     min_derivative: float = DEFAULT_MIN_DERIVATIVE,
+    use_dense: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
 
     inside_interval_mask = (inputs >= -tail_bound) & (inputs <= tail_bound)
@@ -75,6 +84,32 @@ def unconstrained_rational_quadratic_spline(
         constant = np.log(np.exp(1 - min_derivative) - 1)
         unnormalized_derivatives[..., 0] = constant
         unnormalized_derivatives[..., -1] = constant
+
+        if use_dense:
+            # Boolean indexing creates variable-sized tensors and synchronizes
+            # CUDA with the host. Evaluate a safe interior point for each tail,
+            # then select the identity outside the interval. Tail parameters
+            # consequently receive zero gradients, as in the sparse version.
+            safe_inputs = torch.where(inside_interval_mask, inputs, 0.0)
+            spline_outputs, spline_logabsdet = rational_quadratic_spline(
+                safe_inputs,
+                unnormalized_widths,
+                unnormalized_heights,
+                unnormalized_derivatives,
+                inverse=inverse,
+                left=-tail_bound,
+                right=tail_bound,
+                bottom=-tail_bound,
+                top=tail_bound,
+                min_bin_width=min_bin_width,
+                min_bin_height=min_bin_height,
+                min_derivative=min_derivative,
+                check_domain=False,
+            )
+            return (
+                torch.where(inside_interval_mask, spline_outputs, inputs),
+                torch.where(inside_interval_mask, spline_logabsdet, 0.0),
+            )
 
         outputs[outside_interval_mask] = inputs[outside_interval_mask]
         logabsdet[outside_interval_mask] = 0
@@ -115,9 +150,10 @@ def rational_quadratic_spline(
     min_bin_width: float = DEFAULT_MIN_BIN_WIDTH,
     min_bin_height: float = DEFAULT_MIN_BIN_HEIGHT,
     min_derivative: float = DEFAULT_MIN_DERIVATIVE,
+    check_domain: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor]:
 
-    if torch.min(inputs) < left or torch.max(inputs) > right:
+    if check_domain and (torch.min(inputs) < left or torch.max(inputs) > right):
         raise ValueError("Input to a transform is not within its domain")
 
     num_bins = unnormalized_widths.shape[-1]

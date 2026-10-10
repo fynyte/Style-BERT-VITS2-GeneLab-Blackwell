@@ -32,6 +32,8 @@ from style_bert_vits2.logging import logger
 from style_bert_vits2.models import commons, utils
 from style_bert_vits2.models.attentions import MultiHeadAttention
 from style_bert_vits2.models.hyper_parameters import HyperParameters
+from style_bert_vits2.models.modules import ConvFlow
+from style_bert_vits2.models.transforms import piecewise_rational_quadratic_transform
 from style_bert_vits2.models.models_jp_extra import (
     DurationDiscriminator,
     MultiPeriodDiscriminator,
@@ -247,6 +249,16 @@ def run():
         action="store_true",
         help="Use the original relative-position attention arithmetic for comparison.",
     )
+    parser.add_argument(
+        "--disable_algorithm_optimizations",
+        action="store_true",
+        help="Use the original mel, spline, prior expansion and WavLM algorithms for comparison.",
+    )
+    parser.add_argument(
+        "--compile_spline",
+        action="store_true",
+        help="Compile the shared dense training spline (Linux/CUDA with Triton; first step includes compilation).",
+    )
     args = parser.parse_args()
 
     # Set log file
@@ -286,6 +298,9 @@ def run():
     # This is needed because we have to pass values to `train_and_evaluate()
     hps.model_dir = model_dir
     hps.speedup = args.speedup
+    hps.algorithm_optimizations = not args.disable_algorithm_optimizations
+    if args.compile_spline and not hps.algorithm_optimizations:
+        parser.error("--compile_spline requires algorithm optimizations")
     hps.repo_id = args.repo_id
 
     # 比较路径是否相同
@@ -506,9 +521,27 @@ def run():
 
     if hps.train.bf16_run and not args.disable_bf16_optimizations:
         relative_count = _install_compact_relative_attention(net_g)
-        logger.info(
-            f"BF16 compact relative attention enabled: {relative_count} layers"
+        logger.info(f"BF16 compact relative attention enabled: {relative_count} layers")
+
+    if hps.algorithm_optimizations:
+        net_g.use_gather_prior = True
+        spline_transform = (
+            torch.compile(
+                piecewise_rational_quadratic_transform, fullgraph=True, dynamic=True
+            )
+            if args.compile_spline
+            else None
         )
+        for module in net_g.sdp.modules():
+            if isinstance(module, ConvFlow):
+                module.use_dense_spline = True
+                if spline_transform is not None:
+                    module.spline_transform = spline_transform
+        logger.info(
+            "Algorithm optimizations enabled: segment mel, dense spline, gather prior, shared WavLM"
+        )
+        if args.compile_spline:
+            logger.info("Shared spline compilation enabled; first step includes warmup")
 
     net_d = MultiPeriodDiscriminator(hps.model.use_spectral_norm).cuda(local_rank)
     optim_g = torch.optim.AdamW(
@@ -955,16 +988,24 @@ def train_and_evaluate(
                 bert,
                 style_vec,
             )
+            segment_frames = hps.train.segment_size // hps.data.hop_length
+            mel_input = (
+                commons.slice_segments(spec, ids_slice, segment_frames)
+                if hps.algorithm_optimizations
+                else spec
+            )
             mel = spec_to_mel_torch(
-                spec,
+                mel_input,
                 hps.data.filter_length,
                 hps.data.n_mel_channels,
                 hps.data.sampling_rate,
                 hps.data.mel_fmin,
                 hps.data.mel_fmax,
             )
-            y_mel = commons.slice_segments(
-                mel, ids_slice, hps.train.segment_size // hps.data.hop_length
+            y_mel = (
+                mel
+                if hps.algorithm_optimizations
+                else commons.slice_segments(mel, ids_slice, segment_frames)
             )
             y_hat_mel = mel_spectrogram_torch(
                 y_hat.squeeze(1).float(),
@@ -975,6 +1016,9 @@ def train_and_evaluate(
                 hps.data.win_length,
                 hps.data.mel_fmin,
                 hps.data.mel_fmax,
+                # The decoder's final tanh guarantees this range. Avoid two
+                # host synchronizations checking an invariant of y_hat.
+                check_range=not hps.algorithm_optimizations,
             )
 
             y = commons.slice_segments(
@@ -1011,13 +1055,25 @@ def train_and_evaluate(
                 # parameters=net_dur_disc.parameters(), max_norm=5
                 # )
                 scaler.step(optim_dur_disc)
+            wavlm_real_embeddings = None
             if net_wd is not None:
                 # logger.debug(f"y.shape: {y.shape}, y_hat.shape: {y_hat.shape}")
                 # shape: (batch, 1, time)
                 with autocast(enabled=amp_enabled, dtype=amp_dtype):
-                    loss_slm = wl.discriminator(
-                        y.detach().squeeze(1), y_hat.detach().squeeze(1)
-                    ).mean()
+                    if (
+                        hps.algorithm_optimizations
+                        and wl.can_share_embeddings()
+                        and (net_dur_disc is not None or log_this_step)
+                    ):
+                        loss_slm, wavlm_real_embeddings = wl.discriminator(
+                            y.detach().squeeze(1),
+                            y_hat.detach().squeeze(1),
+                            return_real_embeddings=True,
+                        )
+                    else:
+                        loss_slm = wl.discriminator(
+                            y.detach().squeeze(1), y_hat.detach().squeeze(1)
+                        ).mean()
 
                 optim_wd.zero_grad()
                 scaler.scale(loss_slm).backward()
@@ -1051,8 +1107,26 @@ def train_and_evaluate(
                 if net_dur_disc is not None:
                     _, y_dur_hat_g = net_dur_disc(hidden_x, x_mask, logw_, logw, g)
                 if net_wd is not None:
-                    loss_lm = wl(y.detach().squeeze(1), y_hat.squeeze(1)).mean()
-                    loss_lm_gen = wl.generator(y_hat.squeeze(1))
+                    # The existing objective includes these losses only when
+                    # the duration discriminator is enabled. Otherwise they
+                    # are diagnostics and are needed only on logging steps.
+                    if hps.algorithm_optimizations:
+                        if net_dur_disc is not None:
+                            loss_lm, loss_lm_gen = wl.generator_losses(
+                                y.detach().squeeze(1),
+                                y_hat.squeeze(1),
+                                wav_embeddings=wavlm_real_embeddings,
+                            )
+                        elif log_this_step:
+                            with torch.no_grad():
+                                loss_lm, loss_lm_gen = wl.generator_losses(
+                                    y.detach().squeeze(1),
+                                    y_hat.squeeze(1),
+                                    wav_embeddings=wavlm_real_embeddings,
+                                )
+                    else:
+                        loss_lm = wl(y.detach().squeeze(1), y_hat.squeeze(1)).mean()
+                        loss_lm_gen = wl.generator(y_hat.squeeze(1))
                 with autocast(enabled=amp_enabled, dtype=amp_dtype):
                     loss_dur = torch.sum(l_length.float())
                     loss_mel = F.l1_loss(y_mel, y_hat_mel) * hps.train.c_mel
