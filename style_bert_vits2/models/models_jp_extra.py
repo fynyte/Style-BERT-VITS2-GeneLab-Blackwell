@@ -9,6 +9,7 @@ from torch.nn import functional as F
 from torch.nn.utils import remove_weight_norm, spectral_norm, weight_norm
 
 from style_bert_vits2.models import attentions, commons, modules, monotonic_alignment
+from style_bert_vits2.models.prosody import ProsodyAdapter
 from style_bert_vits2.nlp.symbols import NUM_LANGUAGES, NUM_TONES, SYMBOLS
 
 
@@ -239,8 +240,11 @@ class StochasticDurationPredictor(nn.Module):
         g: Optional[torch.Tensor] = None,
         reverse: bool = False,
         noise_scale: float = 1.0,
+        style_condition: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         x = torch.detach(x)
+        if style_condition is not None:
+            x = x + style_condition
         x = self.pre(x)
         if g is not None:
             g = torch.detach(g)
@@ -333,9 +337,12 @@ class DurationPredictor(nn.Module):
             self.cond = nn.Conv1d(gin_channels, in_channels, 1)
 
     def forward(
-        self, x: torch.Tensor, x_mask: torch.Tensor, g: Optional[torch.Tensor] = None
+        self, x: torch.Tensor, x_mask: torch.Tensor, g: Optional[torch.Tensor] = None,
+        style_condition: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         x = torch.detach(x)
+        if style_condition is not None:
+            x = x + style_condition
         if g is not None:
             g = torch.detach(g)
             x = x + self.cond(g)
@@ -1030,6 +1037,13 @@ class SynthesizerTrn(nn.Module):
         else:
             self.ref_enc = ReferenceEncoder(spec_channels, gin_channels)
 
+        # Opt-in for old configs/checkpoints. Existing parameter shapes are kept.
+        self.use_prosody_adapter = kwargs.get("use_prosody_adapter", False)
+        if self.use_prosody_adapter:
+            self.prosody_adapter = ProsodyAdapter(
+                hidden_channels, inter_channels, kwargs.get("prosody_components", 4)
+            )
+
     def forward(
         self,
         x: torch.Tensor,
@@ -1041,6 +1055,7 @@ class SynthesizerTrn(nn.Module):
         language: torch.Tensor,
         bert: torch.Tensor,
         style_vec: torch.Tensor,
+        prosody_targets: Optional[torch.Tensor] = None,
     ) -> tuple[
         torch.Tensor,
         torch.Tensor,
@@ -1095,6 +1110,19 @@ class SynthesizerTrn(nn.Module):
 
         w = attn.sum(2)
 
+        duration_condition = None
+        prosody_loss = None
+        if self.use_prosody_adapter:
+            if prosody_targets is None:
+                raise ValueError("Prosody-enabled training requires frame prosody targets")
+            prediction = self.prosody_adapter.predict(x, x_mask, style_vec)
+            target, voiced = self.prosody_adapter.targets(prosody_targets, attn, w)
+            prosody_loss, features, selected_prosody = self.prosody_adapter.training_loss_and_features(
+                prediction, target, voiced, x_mask
+            )
+            m_p = m_p + self.prosody_adapter.prior_residual(features.to(m_p.dtype)) * x_mask
+            duration_condition = self.prosody_adapter.condition_duration(style_vec)
+
         # [fp16 debug / fix] fp16実行時のみ、self.sdp をfp32で計算し診断チェックも行う。
         # bf16/fp32実行時はこの介入は不要かつ余計なコストになるため、元の実装のまま通す。
         fp16_active = (
@@ -1120,13 +1148,16 @@ class SynthesizerTrn(nn.Module):
                     x_mask.float(),
                     w.float(),
                     g=g.float() if g is not None else None,
+                    style_condition=duration_condition.float() if duration_condition is not None else None,
                 )
         else:
-            l_length_sdp = self.sdp(x, x_mask, w, g=g)
+            l_length_sdp = self.sdp(x, x_mask, w, g=g, style_condition=duration_condition)
         l_length_sdp = l_length_sdp / torch.sum(x_mask)
 
         logw_ = torch.log(w + 1e-6) * x_mask
-        logw = self.dp(x, x_mask, g=g)
+        logw = self.dp(x, x_mask, g=g, style_condition=duration_condition)
+        if self.use_prosody_adapter:
+            logw = self.prosody_adapter.correct_duration(logw, selected_prosody, x_mask)
         # logw_sdp = self.sdp(x, x_mask, g=g, reverse=True, noise_scale=1.0)
         l_length_dp = torch.sum((logw - logw_) ** 2, [1, 2]) / torch.sum(
             x_mask
@@ -1146,7 +1177,7 @@ class SynthesizerTrn(nn.Module):
             z, y_lengths, self.segment_size
         )
         o = self.dec(z_slice, g=g)
-        return (
+        result = (
             o,
             l_length,
             attn,
@@ -1157,6 +1188,7 @@ class SynthesizerTrn(nn.Module):
             (x, logw, logw_),  # , logw_sdp),
             g,
         )
+        return result + (prosody_loss,) if self.use_prosody_adapter else result
 
     def infer(
         self,
@@ -1173,6 +1205,8 @@ class SynthesizerTrn(nn.Module):
         max_len: Optional[int] = None,
         sdp_ratio: float = 0.0,
         y: Optional[torch.Tensor] = None,
+        prosody_component: Optional[int] = None,
+        prosody_noise_scale: float = 0.0,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, tuple[torch.Tensor, ...]]:
         # x, m_p, logs_p, x_mask = self.enc_p(x, x_lengths, tone, language, bert)
         # g = self.gst(y)
@@ -1184,6 +1218,14 @@ class SynthesizerTrn(nn.Module):
         x, m_p, logs_p, x_mask = self.enc_p(
             x, x_lengths, tone, language, bert, style_vec, g=g
         )
+        duration_condition = None
+        if self.use_prosody_adapter:
+            prediction = self.prosody_adapter.predict(x, x_mask, style_vec)
+            features, selected_prosody = self.prosody_adapter.infer_features(
+                prediction, x_mask, prosody_noise_scale, prosody_component
+            )
+            m_p = m_p + self.prosody_adapter.prior_residual(features.to(m_p.dtype)) * x_mask
+            duration_condition = self.prosody_adapter.condition_duration(style_vec)
         # 学習時と同じ理由で、推論時もfp16実行時のみこのサブモジュールをfp32で計算する。
         infer_fp16_active = (
             torch.is_autocast_enabled() and torch.get_autocast_gpu_dtype() == torch.float16
@@ -1196,12 +1238,18 @@ class SynthesizerTrn(nn.Module):
                     g=g.float() if g is not None else None,
                     reverse=True,
                     noise_scale=noise_scale_w,
+                    style_condition=duration_condition.float() if duration_condition is not None else None,
                 )
         else:
             logw_sdp = self.sdp(
-                x, x_mask, g=g, reverse=True, noise_scale=noise_scale_w
+                x, x_mask, g=g, reverse=True, noise_scale=noise_scale_w,
+                style_condition=duration_condition,
             )
-        logw = logw_sdp * (sdp_ratio) + self.dp(x, x_mask, g=g) * (1 - sdp_ratio)
+        logw = logw_sdp * (sdp_ratio) + self.dp(
+            x, x_mask, g=g, style_condition=duration_condition
+        ) * (1 - sdp_ratio)
+        if self.use_prosody_adapter:
+            logw = self.prosody_adapter.correct_duration(logw, selected_prosody, x_mask)
         w = torch.exp(logw) * x_mask * length_scale
         w_ceil = torch.ceil(w)
         y_lengths = torch.clamp_min(torch.sum(w_ceil, [1, 2]), 1).long()

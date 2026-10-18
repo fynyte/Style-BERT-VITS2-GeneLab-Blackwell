@@ -119,6 +119,8 @@ def infer_onnx(
     given_phone: Optional[list[str]] = None,
     given_tone: Optional[list[int]] = None,
 ) -> NDArray[Any]:
+    if hps.model.use_prosody_adapter:
+        raise ValueError("Prosody-adapter checkpoints require PyTorch inference")
     is_jp_extra = hps.version.endswith("JP-Extra")
     bert, ja_bert, en_bert, phones, tones, lang_ids = get_text_onnx(
         text,

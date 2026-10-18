@@ -38,6 +38,7 @@ class HyperParametersTrain(BaseModel):
 
 
 class HyperParametersData(BaseModel):
+    use_prosody_adapter: bool = False
     # use_jp_extra フィールドが存在しない旧モデルとの互換性のために False をデフォルト値とする
     use_jp_extra: bool = False
     training_files: str = "Data/Dummy/train.list"
@@ -71,6 +72,9 @@ class HyperParametersModelSLM(BaseModel):
 
 
 class HyperParametersModel(BaseModel):
+    # False for saved legacy configs. New JP-Extra training config enables it.
+    use_prosody_adapter: bool = False
+    prosody_components: int = 4
     use_spk_conditioned_encoder: bool = True
     use_noise_scaled_mas: bool = True
     use_mel_posterior_encoder: bool = False

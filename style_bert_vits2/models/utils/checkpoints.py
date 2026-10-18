@@ -33,6 +33,17 @@ def load_checkpoint(
 
     assert os.path.isfile(checkpoint_path)
     checkpoint_dict = torch.load(checkpoint_path, map_location=device)
+    saved_state_dict = checkpoint_dict["model"]
+    target_model = model.module if hasattr(model, "module") else model
+    if (any(k.startswith("prosody_adapter.") for k in saved_state_dict)
+            and not getattr(target_model, "use_prosody_adapter", False)):
+        raise ValueError("This checkpoint requires model.use_prosody_adapter=true in config.json")
+    adding_prosody = any(k.startswith("prosody_adapter.") for k in target_model.state_dict()) and not any(
+        k.startswith("prosody_adapter.") for k in saved_state_dict
+    )
+    if adding_prosody and optimizer is not None and not skip_optimizer:
+        logger.info("Adding prosody parameters: initialize optimizer while preserving pretrained weights")
+        skip_optimizer = True
     iteration = checkpoint_dict["iteration"]
     learning_rate = checkpoint_dict["learning_rate"]
     logger.info(
@@ -76,6 +87,8 @@ def load_checkpoint(
                 )
             elif "enc_q" in k and for_infer:
                 continue
+            elif adding_prosody and k.startswith("prosody_adapter."):
+                logger.info(f"Initialize new prosody parameter: {k}")
             else:
                 logger.error(f"{k} is not in the checkpoint {checkpoint_path}")
 

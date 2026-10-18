@@ -34,6 +34,13 @@ def load_safetensors(
                 iteration = f.get_tensor(key).item()
             tensors[key] = f.get_tensor(key)
     if hasattr(model, "module"):
+        target_model = model.module
+    else:
+        target_model = model
+    if (any(k.startswith("prosody_adapter.") for k in tensors)
+            and not getattr(target_model, "use_prosody_adapter", False)):
+        raise ValueError("This checkpoint requires model.use_prosody_adapter=true in config.json")
+    if hasattr(model, "module"):
         result = model.module.load_state_dict(tensors, strict=False)
     else:
         result = model.load_state_dict(tensors, strict=False)

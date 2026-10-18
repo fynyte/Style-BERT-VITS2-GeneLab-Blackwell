@@ -377,6 +377,8 @@ class TTSModel:
         intonation_scale: float = 1.0,
         null_model_params: Optional[dict[int, NullModelParam]] = None,
         force_reload_model: bool = False,
+        prosody_component: Optional[int] = None,
+        prosody_noise_scale: float = 0.0,
     ) -> tuple[int, NDArray[Any]]:
         """
         テキストから音声を合成する。
@@ -466,6 +468,8 @@ class TTSModel:
                         style_vec=style_vector,
                         given_phone=given_phone,
                         given_tone=given_tone,
+                        prosody_component=prosody_component,
+                        prosody_noise_scale=prosody_noise_scale,
                     )
 
             # 改行ごとに分割して音声を生成
@@ -489,6 +493,8 @@ class TTSModel:
                                 assist_text=assist_text,
                                 assist_text_weight=assist_text_weight,
                                 style_vec=style_vector,
+                                prosody_component=prosody_component,
+                                prosody_noise_scale=prosody_noise_scale,
                             )
                         )
                         if i != len(texts) - 1:

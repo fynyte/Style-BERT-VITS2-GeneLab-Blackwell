@@ -1,6 +1,7 @@
 import argparse
 import datetime
 import gc
+import json
 import os
 import platform
 from contextlib import contextmanager
@@ -225,6 +226,10 @@ def run():
         help="Skip saving default style config and mean vector.",
     )
     parser.add_argument(
+        "--enable_prosody", action="store_true",
+        help="Upgrade an existing JP-Extra config to train the expressive prosody adapter.",
+    )
+    parser.add_argument(
         "--no_progress_bar",
         action="store_true",
         help="Do not show the progress bar while training.",
@@ -299,6 +304,16 @@ def run():
     n_gpus = dist.get_world_size()
 
     hps = HyperParameters.load_from_json(args.config)
+    if args.enable_prosody:
+        hps.model.use_prosody_adapter = True
+        if rank == 0:
+            with open(args.config, encoding="utf-8") as f:
+                saved_config = json.load(f)
+            saved_config["model"]["use_prosody_adapter"] = True
+            saved_config["model"]["prosody_components"] = hps.model.prosody_components
+            with open(args.config, "w", encoding="utf-8") as f:
+                json.dump(saved_config, f, indent=2, ensure_ascii=False)
+        dist.barrier()
     # This is needed because we have to pass values to `train_and_evaluate()
     hps.model_dir = model_dir
     hps.speedup = args.speedup
@@ -357,13 +372,25 @@ def run():
         )
     os.makedirs(config.out_dir, exist_ok=True)
 
-    if not args.skip_default_style:
+    if rank == 0 and not args.skip_default_style:
         default_style.save_styles_by_dirs(
             os.path.join(args.model, "wavs"),
             config.out_dir,
             config_path=args.config,
             config_output_path=os.path.join(config.out_dir, "config.json"),
         )
+
+    if rank == 0:
+        # Keep architecture metadata even when reusing existing style presets.
+        assets_config = os.path.join(config.out_dir, "config.json")
+        if os.path.isfile(assets_config):
+            with open(assets_config, encoding="utf-8") as f:
+                saved_config = json.load(f)
+            saved_config["model"]["use_prosody_adapter"] = hps.model.use_prosody_adapter
+            saved_config["model"]["prosody_components"] = hps.model.prosody_components
+            with open(assets_config, "w", encoding="utf-8") as f:
+                json.dump(saved_config, f, indent=2, ensure_ascii=False)
+    dist.barrier()
 
     torch.manual_seed(hps.train.seed)
     torch.cuda.set_device(local_rank)
@@ -377,6 +404,7 @@ def run():
         utils.check_git_hash(model_dir)
         writer = SummaryWriter(log_dir=model_dir)
         writer_eval = SummaryWriter(log_dir=os.path.join(model_dir, "eval"))
+    hps.data.use_prosody_adapter = hps.model.use_prosody_adapter
     train_dataset = TextAudioSpeakerLoader(hps.data.training_files, hps.data)
     collate_fn = TextAudioSpeakerCollate(use_jp_extra=True)
     if not args.not_use_custom_batch_sampler:
@@ -479,6 +507,8 @@ def run():
         len(SYMBOLS),
         hps.data.filter_length // 2 + 1,
         hps.train.segment_size // hps.data.hop_length,
+        use_prosody_adapter=hps.model.use_prosody_adapter,
+        prosody_components=hps.model.prosody_components,
         n_speakers=hps.data.n_speakers,
         mas_noise_scale_initial=mas_noise_scale_initial,
         noise_scale_delta=noise_scale_delta,
@@ -625,7 +655,7 @@ def run():
                     optim_dur_disc.param_groups[0]["initial_lr"] = dur_resume_lr
             except:
                 if not optim_dur_disc.param_groups[0].get("initial_lr"):
-                    optim_dur_disc.param_groups[0]["initial_lr"] = dur_resume_lr
+                    optim_dur_disc.param_groups[0]["initial_lr"] = hps.train.learning_rate
                 print("Initialize dur_disc")
         if net_wd is not None:
             try:
@@ -643,7 +673,7 @@ def run():
                     optim_wd.param_groups[0]["initial_lr"] = wd_resume_lr
             except:
                 if not optim_wd.param_groups[0].get("initial_lr"):
-                    optim_wd.param_groups[0]["initial_lr"] = wd_resume_lr
+                    optim_wd.param_groups[0]["initial_lr"] = hps.train.learning_rate
                 logger.info("Initialize wavlm")
 
         try:
@@ -689,14 +719,6 @@ def run():
             _ = utils.safetensors.load_safetensors(
                 os.path.join(model_dir, "D_0.safetensors"), net_d
             )
-            if net_dur_disc is not None:
-                _ = utils.safetensors.load_safetensors(
-                    os.path.join(model_dir, "DUR_0.safetensors"), net_dur_disc
-                )
-            if net_wd is not None:
-                _ = utils.safetensors.load_safetensors(
-                    os.path.join(model_dir, "WD_0.safetensors"), net_wd
-                )
             logger.info("Loaded the pretrained models.")
         except Exception as e:
             logger.warning(e)
@@ -706,6 +728,15 @@ def run():
         finally:
             epoch_str = 1
             global_step = 0
+
+        # New discriminators do not require regenerating the G/D pretrain.
+        for name, discriminator in (("DUR", net_dur_disc), ("WD", net_wd)):
+            if discriminator is not None:
+                path = os.path.join(model_dir, f"{name}_0.safetensors")
+                if os.path.isfile(path):
+                    utils.safetensors.load_safetensors(path, discriminator)
+                else:
+                    logger.info(f"No {name} pretrain; initialize only this discriminator")
 
     def lr_lambda(epoch):
         """
@@ -930,19 +961,21 @@ def train_and_evaluate(
         net_dur_disc.train()
     if net_wd is not None:
         net_wd.train()
-    for batch_idx, (
-        x,
-        x_lengths,
-        spec,
-        spec_lengths,
-        y,
-        y_lengths,
-        speakers,
-        tone,
-        language,
-        bert,
-        style_vec,
-    ) in enumerate(train_loader):
+    for batch_idx, batch in enumerate(train_loader):
+        (
+            x,
+            x_lengths,
+            spec,
+            spec_lengths,
+            y,
+            y_lengths,
+            speakers,
+            tone,
+            language,
+            bert,
+            style_vec,
+        ) = batch[:11]
+        prosody_targets = batch[11].cuda(local_rank, non_blocking=True) if hps.model.use_prosody_adapter else None
         # 勾配ノルムはログ用のみ。通常ステップでは計測しないことで、GPU 同期を
         # 発生させない。rank 0 以外はこの値を出力しないため計測不要。
         log_this_step = (
@@ -982,6 +1015,7 @@ def train_and_evaluate(
                 (z, z_p, m_p, logs_p, m_q, logs_q),
                 (hidden_x, logw, logw_),  # , logw_sdp),
                 g,
+                *extra_losses,
             ) = net_g(
                 x,
                 x_lengths,
@@ -992,7 +1026,9 @@ def train_and_evaluate(
                 language,
                 bert,
                 style_vec,
+                prosody_targets=prosody_targets,
             )
+            loss_prosody = extra_losses[0] if extra_losses else y_hat.new_zeros(())
             segment_frames = hps.train.segment_size // hps.data.hop_length
             mel_input = (
                 commons.slice_segments(spec, ids_slice, segment_frames)
@@ -1068,7 +1104,6 @@ def train_and_evaluate(
                     if (
                         algorithm_optimizations
                         and wl.can_share_embeddings()
-                        and (net_dur_disc is not None or log_this_step)
                     ):
                         loss_slm, wavlm_real_embeddings = wl.discriminator(
                             y.detach().squeeze(1),
@@ -1112,23 +1147,12 @@ def train_and_evaluate(
                 if net_dur_disc is not None:
                     _, y_dur_hat_g = net_dur_disc(hidden_x, x_mask, logw_, logw, g)
                 if net_wd is not None:
-                    # The existing objective includes these losses only when
-                    # the duration discriminator is enabled. Otherwise they
-                    # are diagnostics and are needed only on logging steps.
                     if algorithm_optimizations:
-                        if net_dur_disc is not None:
-                            loss_lm, loss_lm_gen = wl.generator_losses(
-                                y.detach().squeeze(1),
-                                y_hat.squeeze(1),
-                                wav_embeddings=wavlm_real_embeddings,
-                            )
-                        elif log_this_step:
-                            with torch.no_grad():
-                                loss_lm, loss_lm_gen = wl.generator_losses(
-                                    y.detach().squeeze(1),
-                                    y_hat.squeeze(1),
-                                    wav_embeddings=wavlm_real_embeddings,
-                                )
+                        loss_lm, loss_lm_gen = wl.generator_losses(
+                            y.detach().squeeze(1),
+                            y_hat.squeeze(1),
+                            wav_embeddings=wavlm_real_embeddings,
+                        )
                     else:
                         loss_lm = wl(y.detach().squeeze(1), y_hat.squeeze(1)).mean()
                         loss_lm_gen = wl.generator(y_hat.squeeze(1))
@@ -1141,13 +1165,12 @@ def train_and_evaluate(
                     loss_gen, losses_gen = generator_loss(y_d_hat_g)
                     # loss_commit = loss_commit * hps.train.c_commit
 
-                    loss_gen_all = loss_gen + loss_fm + loss_mel + loss_dur + loss_kl
+                    loss_gen_all = loss_gen + loss_fm + loss_mel + loss_dur + loss_kl + loss_prosody
                     if net_dur_disc is not None:
                         loss_dur_gen, losses_dur_gen = generator_loss(y_dur_hat_g)
-                        if net_wd is not None:
-                            loss_gen_all += loss_dur_gen + loss_lm + loss_lm_gen
-                        else:
-                            loss_gen_all += loss_dur_gen
+                        loss_gen_all += loss_dur_gen
+                    if net_wd is not None:
+                        loss_gen_all += loss_lm + loss_lm_gen
             optim_g.zero_grad()
             scaler.scale(loss_gen_all).backward()
             scaler.unscale_(optim_g)
@@ -1184,6 +1207,7 @@ def train_and_evaluate(
                         "loss/g/mel": loss_mel,
                         "loss/g/dur": loss_dur,
                         "loss/g/kl": loss_kl,
+                        "loss/g/prosody": loss_prosody,
                     }
                 )
                 scalar_dict.update({f"loss/g/{i}": v for i, v in enumerate(losses_gen)})
@@ -1336,19 +1360,20 @@ def evaluate(hps, generator, eval_loader, writer_eval):
     print()
     logger.info("Evaluating ...")
     with torch.no_grad():
-        for batch_idx, (
-            x,
-            x_lengths,
-            spec,
-            spec_lengths,
-            y,
-            y_lengths,
-            speakers,
-            tone,
-            language,
-            bert,
-            style_vec,
-        ) in enumerate(eval_loader):
+        for batch_idx, batch in enumerate(eval_loader):
+            (
+                x,
+                x_lengths,
+                spec,
+                spec_lengths,
+                y,
+                y_lengths,
+                speakers,
+                tone,
+                language,
+                bert,
+                style_vec,
+            ) = batch[:11]
             x, x_lengths = x.cuda(), x_lengths.cuda()
             spec, spec_lengths = spec.cuda(), spec_lengths.cuda()
             y, y_lengths = y.cuda(), y_lengths.cuda()

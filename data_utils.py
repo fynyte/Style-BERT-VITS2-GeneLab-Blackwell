@@ -141,6 +141,20 @@ class TextAudioSpeakerLoader(torch.utils.data.Dataset):
         sid = torch.LongTensor([int(self.spk_map[sid])])
         style_vec = torch.FloatTensor(np.load(f"{audiopath}.npy"))
         if self.use_jp_extra:
+            if self.hparams.use_prosody_adapter:
+                from style_bert_vits2.prosody_features import load_or_extract_prosody
+
+                if (style_vec.numel() != 256 or not torch.isfinite(style_vec).all()
+                        or not torch.any(style_vec != 0)):
+                    raise ValueError(f"Invalid/zero style embedding: {audiopath}.npy; regenerate with style_gen.py")
+                if not torch.isfinite(ja_bert).all() or not torch.any(ja_bert != 0):
+                    raise ValueError(f"Invalid/zero Japanese BERT features: {audiopath}; regenerate with bert_gen.py")
+                features = load_or_extract_prosody(
+                    audiopath, wav.numpy(), self.sampling_rate, self.hop_length,
+                    self.filter_length, spec.size(1),
+                )
+                return (phones, spec, wav, sid, tone, language, ja_bert, style_vec.reshape(256),
+                        torch.from_numpy(features))
             return (phones, spec, wav, sid, tone, language, ja_bert, style_vec)
         else:
             return (
@@ -291,6 +305,9 @@ class TextAudioSpeakerCollate:
 
         spec_padded = torch.FloatTensor(len(batch), batch[0][1].size(0), max_spec_len)
         wav_padded = torch.FloatTensor(len(batch), 1, max_wav_len)
+        with_prosody = self.use_jp_extra and len(batch[0]) == 9
+        if with_prosody:
+            prosody_padded = torch.zeros(len(batch), 3, max_spec_len)
         text_padded.zero_()
         tone_padded.zero_()
         language_padded.zero_()
@@ -330,6 +347,8 @@ class TextAudioSpeakerCollate:
 
             if self.use_jp_extra:
                 style_vec[i, :] = row[7]
+                if with_prosody:
+                    prosody_padded[i, :, : row[8].size(1)] = row[8]
             else:
                 ja_bert = row[7]
                 ja_bert_padded[i, :, : ja_bert.size(1)] = ja_bert
@@ -339,7 +358,7 @@ class TextAudioSpeakerCollate:
                 style_vec[i, :] = row[9]
 
         if self.use_jp_extra:
-            return (
+            result = (
                 text_padded,
                 text_lengths,
                 spec_padded,
@@ -352,6 +371,7 @@ class TextAudioSpeakerCollate:
                 bert_padded,
                 style_vec,
             )
+            return result + (prosody_padded,) if with_prosody else result
         else:
             return (
                 text_padded,

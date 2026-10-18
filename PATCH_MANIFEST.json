@@ -1,0 +1,22 @@
+{
+  "base_commit": "84eebb27d893982ddc6e1e196c1f6dda0b1ad399",
+  "files": {
+    "EXPRESSIVE_PROSODY.md": "ad70ea7c520bfe9f7413ee6a70b061403ad5de147b3fd07751679de7bb952ebc",
+    "configs/config_jp_extra.json": "caf7afd04d9dbc24fcfaab130363112dd1ce8fafdba6830dfe782897a37f76e5",
+    "convert_onnx.py": "9f93481f395e65956cb5e100471006ded6c3d0bb836fe224f136a2f13d05841f",
+    "data_utils.py": "3fde5f03f275a46fa2192954ade4a9b03f31444aa9a3f16a871070162d7bb623",
+    "modal_prosody_test.py": "1a13b38fd43bf3e87c533e06ae5f72bdc7385c92e6562027f2474b8c8d1fe79b",
+    "style_bert_vits2/models/hyper_parameters.py": "95c7e4d42802e0ce55cb5eb4f5ae95b0b16c2ed6da769489cb9f08b3d3c88dbe",
+    "style_bert_vits2/models/infer.py": "17f464feebc5565cac0a8c4eab106e246f118e5f21d8b2421e12c8d6b367b410",
+    "style_bert_vits2/models/infer_onnx.py": "0b792dc0c3a0e66b93fd96ae11495790f58f5b9efcb08ce3bbdc732df28f3235",
+    "style_bert_vits2/models/models_jp_extra.py": "0296e36c51c476c1b350444d673e08bfecea1b0a718cbb304b238d24fc0934ae",
+    "style_bert_vits2/models/prosody.py": "7d21aab0def558b16fc3be19c89690e9b336bcf22862931ae3f1882ba4765df0",
+    "style_bert_vits2/models/utils/checkpoints.py": "fae9f8c9c9dc625e7a74c302605d56f4040827e82600d94408afe262a3205f92",
+    "style_bert_vits2/models/utils/safetensors.py": "7e7a7926100f3fae81de670a43b52432cf0e5b73a0e0692b855fd9c5a9d656a3",
+    "style_bert_vits2/prosody_features.py": "9b353f1b82786173da163205fd1c5288c543210a68c0bc6ff37539031d75a600",
+    "style_bert_vits2/tts_model.py": "47251c5497ee5db103b2245494e6ad42e91c7112c68ea1f1c1a4cc64c9805465",
+    "tests/prosody_smoke.py": "87273dc0866492ca1faeab44785cc2daab124d57855289c6e83fcba42a711ccd",
+    "tests/test_prosody.py": "85e6a3b53cc6c835a57034fa9b4c37d4115121293256d56c9fc4e6702cedfbea",
+    "train_ms_jp_extra.py": "94aeed96856a7dd33f7d1618799ab862f981082a54477cc0b09cd6c7c33ef257"
+  }
+}

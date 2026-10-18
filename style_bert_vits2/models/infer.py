@@ -25,6 +25,8 @@ def get_net_g(
     if version.endswith("JP-Extra"):
         logger.info("Using JP-Extra model")
         net_g = SynthesizerTrnJPExtra(
+            use_prosody_adapter=hps.model.use_prosody_adapter,
+            prosody_components=hps.model.prosody_components,
             n_vocab=len(SYMBOLS),
             spec_channels=hps.data.filter_length // 2 + 1,
             segment_size=hps.train.segment_size // hps.data.hop_length,
@@ -182,6 +184,8 @@ def infer(
     assist_text_weight: float = 0.7,
     given_phone: Optional[list[str]] = None,
     given_tone: Optional[list[int]] = None,
+    prosody_component: Optional[int] = None,
+    prosody_noise_scale: float = 0.0,
 ) -> NDArray[Any]:
     is_jp_extra = hps.version.endswith("JP-Extra")
     bert, ja_bert, en_bert, phones, tones, lang_ids = get_text(
@@ -234,6 +238,8 @@ def infer(
                 sdp_ratio=sdp_ratio,
                 noise_scale=noise_scale,
                 noise_scale_w=noise_scale_w,
+                prosody_component=prosody_component,
+                prosody_noise_scale=prosody_noise_scale,
             )
         else:
             output = cast(SynthesizerTrn, net_g).infer(

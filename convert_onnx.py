@@ -165,6 +165,8 @@ if __name__ == "__main__":
                 device=device,
             )
             tts_model.load()
+            if tts_model.hyper_parameters.model.use_prosody_adapter:
+                raise ValueError("Prosody-adapter checkpoints require PyTorch inference; ONNX export is not supported")
             if DEFAULT_STYLE in tts_model.style2id:
                 style_id = tts_model.style2id[DEFAULT_STYLE]
             else:
