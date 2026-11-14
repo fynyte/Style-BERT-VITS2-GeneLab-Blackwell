@@ -198,6 +198,12 @@ def maximum_path(neg_cent: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
 def __maximum_path_jit(paths: Any, values: Any, t_ys: Any, t_xs: Any) -> None:
     """
     与えられたパス、値、およびターゲットの y と x 座標を使用して JIT で最大パスを計算する
+
+    Args:
+        paths: 計算されたパスを格納するための整数型の 3 次元配列
+        values: 値を格納するための浮動小数点型の 3 次元配列
+        t_ys: ターゲットの y 座標を格納するための整数型の 1 次元配列
+        t_xs: ターゲットの x 座標を格納するための整数型の 1 次元配列
     """
     b = paths.shape[0]
     max_neg_val = -1e9

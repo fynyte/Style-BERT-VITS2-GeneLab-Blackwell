@@ -13,7 +13,8 @@ from style_bert_vits2.nlp.symbols import NUM_LANGUAGES, NUM_TONES, SYMBOLS
 
 
 def _assert_finite(tensor: Optional[torch.Tensor], name: str) -> None:
-    """[fp16 debug] NaN/Inf の発生源を特定するための一時的な診断ヘルパー。"""
+    """[fp16 debug] NaN/Inf の発生源を特定するための一時的な診断ヘルパー。
+    問題箇所が判明したら削除して構わない。"""
     if tensor is None:
         return
     if not torch.isfinite(tensor).all():
@@ -752,6 +753,7 @@ class DiscriminatorS(torch.nn.Module):
 class MultiPeriodDiscriminator(torch.nn.Module):
     def __init__(self, use_spectral_norm: bool = False) -> None:
         super(MultiPeriodDiscriminator, self).__init__()
+        self.use_spectral_norm = use_spectral_norm
         periods = [2, 3, 5, 7, 11]
 
         discs = [DiscriminatorS(use_spectral_norm=use_spectral_norm)]
@@ -772,14 +774,20 @@ class MultiPeriodDiscriminator(torch.nn.Module):
         y_d_gs = []
         fmap_rs = []
         fmap_gs = []
-        no_grad_real = y_hat.requires_grad and not y.requires_grad
+        no_grad_real = (
+            y_hat.requires_grad
+            and not y.requires_grad
+            and not getattr(self, "use_spectral_norm", False)
+        )
         for d in self.discriminators:
             if no_grad_real:
+                # Run generated audio first so PyTorch < 2.5 autocast caches casts with grad_fn before no_grad real pass.
+                y_d_g, fmap_g = d(y_hat, include_fmap=include_fmap)
                 with torch.no_grad():
                     y_d_r, fmap_r = d(y, include_fmap=include_fmap)
             else:
                 y_d_r, fmap_r = d(y, include_fmap=include_fmap)
-            y_d_g, fmap_g = d(y_hat, include_fmap=include_fmap)
+                y_d_g, fmap_g = d(y_hat, include_fmap=include_fmap)
             y_d_rs.append(y_d_r)
             y_d_gs.append(y_d_g)
             if include_fmap:

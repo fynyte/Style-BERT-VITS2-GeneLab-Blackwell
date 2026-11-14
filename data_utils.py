@@ -96,6 +96,7 @@ class TextAudioSpeakerLoader(torch.utils.data.Dataset):
         """
         __init__時に全サンプル（音声・スペクトログラム・BERT特徴量・スタイルベクトル）を
         あらかじめデシリアライズしてメモリ上のリストに保持しておく。
+        これにより __getitem__ 時のファイルI/O・torch.load/np.loadのデコードコストがなくなる。
         """
         logger.info("Preloading all samples into memory (this may take a while)...")
         self.cache = [None] * len(self.audiopaths_sid_text)
@@ -115,6 +116,11 @@ class TextAudioSpeakerLoader(torch.utils.data.Dataset):
         )
 
     def _load_sample(self, audiopath_sid_text):
+        """
+        1サンプル分を実際にディスク（または /dev/shm 等）から読み込み、
+        get_audio_text_speaker_pair が返すのと同じ形式のタプルを構築する。
+        通常の都度読み込みとプリロード（_preload）の両方から呼ばれる共通処理。
+        """
         audiopath, sid, language, text, phones, tone, word2ph = audiopath_sid_text
 
         bert, ja_bert, en_bert, phones, tone, language = self.get_text(
@@ -358,6 +364,10 @@ class DistributedBucketSampler(torch.utils.data.distributed.DistributedSampler):
     """
     Maintain similar input lengths in a batch.
     Length groups are specified by boundaries.
+    Ex) boundaries = [b1, b2, b3] -> any batch is included either {x | b1 < length(x) <=b2} or {x | b2 < length(x) <= b3}.
+
+    It removes samples which are not included in the boundaries.
+    Ex) boundaries = [b1, b2, b3] -> any x s.t. length(x) <= b1 or length(x) > b3 are discarded.
     """
 
     def __init__(

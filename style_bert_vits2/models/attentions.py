@@ -10,7 +10,9 @@ from style_bert_vits2.models import commons
 
 
 def _assert_finite(tensor: Optional[torch.Tensor], name: str) -> None:
-    """[fp16 debug] NaN/Inf の発生源を特定するための一時的な診断ヘルパー。"""
+    """[fp16 debug] NaN/Inf の発生源を特定するための一時的な診断ヘルパー。
+    問題箇所が判明したら削除して構わない。models_jp_extra.py の同名関数と重複しているが、
+    循環importを避けるためここでも定義している。"""
     if tensor is None:
         return
     if not torch.isfinite(tensor).all():

@@ -156,29 +156,55 @@ def _install_compact_relative_attention(net):
     return count
 
 
+def _has_spectral_norm_buffers(discriminator) -> bool:
+    if isinstance(
+        discriminator, (nn.DataParallel, nn.parallel.DistributedDataParallel)
+    ):
+        discriminator = discriminator.module
+    return any("weight_u" in module._buffers for module in discriminator.modules())
+
+
+def can_isolate_discriminator_for_generator(
+    discriminator,
+    *,
+    use_spectral_norm: bool,
+    wavlm_discriminator=None,
+) -> bool:
+    """Return true when the G-step discriminator pass can skip D param gradients."""
+    if use_spectral_norm or wavlm_discriminator is not None:
+        return False
+    if isinstance(discriminator, nn.DataParallel):
+        return False
+    return not _has_spectral_norm_buffers(discriminator)
+
+
+def _compute_d_generator_loss(fmap_r, fmap_g, y_d_hat_g):
+    loss_fm = feature_loss(fmap_r, fmap_g)
+    loss_gen, losses_gen = generator_loss(y_d_hat_g)
+    return loss_fm, loss_gen, losses_gen, loss_gen + loss_fm
+
+
 def can_freeze_discriminator_for_generator(
     discriminator, *, use_spectral_norm, duration_discriminator=None,
     wavlm_discriminator=None, world_size=None,
 ):
     """Return false for configurations outside the numerically validated scope."""
-    if (
-        use_spectral_norm
-        or duration_discriminator is not None
-        or wavlm_discriminator is not None
-    ):
+    if duration_discriminator is not None:
         return False
     if world_size is not None and int(world_size) != 1:
         return False
     if torch.distributed.is_initialized() and torch.distributed.get_world_size() != 1:
         return False
-    if isinstance(discriminator, nn.DataParallel):
+    if (
+        isinstance(discriminator, nn.parallel.DistributedDataParallel)
+        and torch.distributed.get_world_size(discriminator.process_group) != 1
+    ):
         return False
-    if isinstance(discriminator, nn.parallel.DistributedDataParallel):
-        if torch.distributed.get_world_size(discriminator.process_group) != 1:
-            return False
-        discriminator = discriminator.module
-    # Check the actual legacy spectral-norm buffers as well as the config flag.
-    return not any("weight_u" in module._buffers for module in discriminator.modules())
+    return can_isolate_discriminator_for_generator(
+        discriminator,
+        use_spectral_norm=use_spectral_norm,
+        wavlm_discriminator=wavlm_discriminator,
+    )
 
 
 @contextmanager
@@ -509,7 +535,7 @@ def run():
         for param in net_g.dec.parameters():
             param.requires_grad = False
 
-    if (hps.train.bf16_run or hps.train.fp16_run) and not args.disable_bf16_optimizations:
+    if hps.train.bf16_run and not args.disable_bf16_optimizations:
         relative_count = _install_compact_relative_attention(net_g)
         logger.info(f"Compact relative attention enabled: {relative_count} layers")
 
@@ -567,33 +593,37 @@ def run():
     net_g = DDP(
         net_g,
         device_ids=[local_rank],
+        gradient_as_bucket_view=True,
     )
     net_d = DDP(
         net_d,
         device_ids=[local_rank],
+        gradient_as_bucket_view=True,
     )
     if net_dur_disc is not None:
         net_dur_disc = DDP(
             net_dur_disc,
             device_ids=[local_rank],
+            gradient_as_bucket_view=True,
         )
     if net_wd is not None:
         net_wd = DDP(
             net_wd,
             device_ids=[local_rank],
+            gradient_as_bucket_view=True,
         )
 
     net_d._sbv2_freeze_for_generator = (
         (hps.train.bf16_run or hps.train.fp16_run)
         and not args.disable_bf16_optimizations
-        and can_freeze_discriminator_for_generator(
-            net_d, use_spectral_norm=hps.model.use_spectral_norm,
-            duration_discriminator=net_dur_disc, wavlm_discriminator=net_wd,
-            world_size=n_gpus,
+        and can_isolate_discriminator_for_generator(
+            net_d,
+            use_spectral_norm=hps.model.use_spectral_norm,
+            wavlm_discriminator=net_wd,
         )
     )
     if net_d._sbv2_freeze_for_generator:
-        logger.info("Generator update: skip unused discriminator parameter gradients")
+        logger.info("Generator update: isolate discriminator from G-step parameter gradients")
 
     if utils.is_resuming(model_dir):
         if net_dur_disc is not None:
@@ -692,6 +722,11 @@ def run():
             global_step = 0
 
     def lr_lambda(epoch):
+        """
+        Learning rate scheduler for warmup and exponential decay.
+        - During the warmup period, the learning rate increases linearly.
+        - After the warmup period, the learning rate decreases exponentially.
+        """
         if epoch < hps.train.warmup_epochs:
             return float(epoch) / float(max(1, hps.train.warmup_epochs))
         else:
@@ -1008,18 +1043,6 @@ def train_and_evaluate(
                 else commons.slice_segments(mel, ids_slice, segment_frames)
             )
             del mel
-            y_hat_mel = mel_spectrogram_torch(
-                y_hat.squeeze(1).float(),
-                hps.data.filter_length,
-                hps.data.n_mel_channels,
-                hps.data.sampling_rate,
-                hps.data.hop_length,
-                hps.data.win_length,
-                hps.data.mel_fmin,
-                hps.data.mel_fmax,
-                check_range=not algorithm_optimizations,
-            )
-
             y = commons.slice_segments(
                 y, ids_slice * hps.data.hop_length, hps.train.segment_size
             )
@@ -1095,18 +1118,40 @@ def train_and_evaluate(
         scaler.step(optim_d)
         optim_d.zero_grad(set_to_none=True)
 
-        with generator_discriminator_pass(
-            net_d, enabled=freeze_d_for_g,
-            use_spectral_norm=hps.model.use_spectral_norm,
-            duration_discriminator=net_dur_disc, wavlm_discriminator=net_wd,
-        ) as g_discriminator:
+        isolate_d_for_g = (
+            freeze_d_for_g
+            and y_hat.requires_grad
+            and y_hat.grad_fn is not None
+        )
+        grad_y_hat_d = None
+        if isolate_d_for_g:
+            disc_module = (
+                net_d.module
+                if isinstance(net_d, nn.parallel.DistributedDataParallel)
+                else net_d
+            )
+            y_hat_d = y_hat.detach().requires_grad_(True)
             with autocast(enabled=amp_enabled, dtype=amp_dtype):
-                # Generator
-                y_d_hat_r, y_d_hat_g, fmap_r, fmap_g = g_discriminator(y, y_hat)
+                y_d_hat_r, y_d_hat_g, fmap_r, fmap_g = disc_module(y, y_hat_d)
+                del y, y_d_hat_r
+                loss_fm, loss_gen, losses_gen, loss_d_gen = _compute_d_generator_loss(
+                    fmap_r, fmap_g, y_d_hat_g
+                )
+                del fmap_r, fmap_g, y_d_hat_g
+            # Differentiate outside autocast, avoiding D param grads and DDP AllReduce.
+            (grad_y_hat_d,) = torch.autograd.grad(
+                scaler.scale(loss_d_gen),
+                y_hat_d,
+            )
+            del y_hat_d
+            loss_fm = loss_fm.detach()
+            loss_gen = loss_gen.detach()
+            loss_d_gen = loss_d_gen.detach()
+        with autocast(enabled=amp_enabled, dtype=amp_dtype):
+            # Generator
+            if not isolate_d_for_g:
+                y_d_hat_r, y_d_hat_g, fmap_r, fmap_g = net_d(y, y_hat)
                 del y_d_hat_r
-                if net_dur_disc is not None:
-                    _, y_dur_hat_g = net_dur_disc(hidden_x, x_mask, logw_, logw, g)
-                    del hidden_x, x_mask, logw_, logw, g
                 if net_wd is not None:
                     if algorithm_optimizations:
                         if net_dur_disc is not None:
@@ -1126,37 +1171,61 @@ def train_and_evaluate(
                         loss_lm = wl(y.detach().squeeze(1), y_hat.squeeze(1)).mean()
                         loss_lm_gen = wl.generator(y_hat.squeeze(1))
                     del wavlm_real_embeddings
-                del y, y_hat
-                with autocast(enabled=amp_enabled, dtype=amp_dtype):
-                    loss_dur = torch.sum(l_length.float())
-                    del l_length
-                    loss_mel = F.l1_loss(y_mel, y_hat_mel) * hps.train.c_mel
-                    del y_mel, y_hat_mel
-                    loss_kl = kl_loss(z_p, logs_q, m_p, logs_p, z_mask) * hps.train.c_kl
-                    del z_p, logs_q, m_p, logs_p, z_mask
+                del y
+                loss_fm, loss_gen, losses_gen, loss_d_gen = _compute_d_generator_loss(
+                    fmap_r, fmap_g, y_d_hat_g
+                )
+                del fmap_r, fmap_g, y_d_hat_g
 
-                    loss_fm = feature_loss(fmap_r, fmap_g)
-                    del fmap_r, fmap_g
-                    loss_gen, losses_gen = generator_loss(y_d_hat_g)
-                    del y_d_hat_g
+            if net_dur_disc is not None:
+                _, y_dur_hat_g = net_dur_disc(hidden_x, x_mask, logw_, logw, g)
+                del hidden_x, x_mask, logw_, logw, g
 
-                    loss_gen_all = loss_gen + loss_fm + loss_mel + loss_dur + loss_kl
-                    if net_dur_disc is not None:
-                        loss_dur_gen, losses_dur_gen = generator_loss(y_dur_hat_g)
-                        del y_dur_hat_g
-                        if net_wd is not None:
-                            loss_gen_all += loss_dur_gen + loss_lm + loss_lm_gen
-                        else:
-                            loss_gen_all += loss_dur_gen
-            optim_g.zero_grad(set_to_none=True)
+            y_hat_mel = mel_spectrogram_torch(
+                y_hat.squeeze(1).float(),
+                hps.data.filter_length,
+                hps.data.n_mel_channels,
+                hps.data.sampling_rate,
+                hps.data.hop_length,
+                hps.data.win_length,
+                hps.data.mel_fmin,
+                hps.data.mel_fmax,
+                check_range=not algorithm_optimizations,
+            )
+            if not isolate_d_for_g:
+                del y_hat
+
+            loss_dur = torch.sum(l_length.float())
+            del l_length
+            loss_mel = F.l1_loss(y_mel, y_hat_mel) * hps.train.c_mel
+            del y_mel, y_hat_mel
+            loss_kl = kl_loss(z_p, logs_q, m_p, logs_p, z_mask) * hps.train.c_kl
+            del z_p, logs_q, m_p, logs_p, z_mask
+
+            loss_gen_all = loss_d_gen + loss_mel + loss_dur + loss_kl
+            if net_dur_disc is not None:
+                loss_dur_gen, losses_dur_gen = generator_loss(y_dur_hat_g)
+                del y_dur_hat_g
+                if net_wd is not None:
+                    loss_gen_all += loss_dur_gen + loss_lm + loss_lm_gen
+                else:
+                    loss_gen_all += loss_dur_gen
+        optim_g.zero_grad(set_to_none=True)
+        if grad_y_hat_d is not None:
+            torch.autograd.backward(
+                [scaler.scale(loss_gen_all), y_hat],
+                [None, grad_y_hat_d],
+            )
+            del y_hat, grad_y_hat_d
+        else:
             scaler.scale(loss_gen_all).backward()
-            scaler.unscale_(optim_g)
-            if amp_enabled:
-                torch.nn.utils.clip_grad_norm_(parameters=net_g_params, max_norm=500)
-            if log_this_step:
-                grad_norm_g = commons.clip_grad_value_(net_g_params, None)
-            scaler.step(optim_g)
-            optim_g.zero_grad(set_to_none=True)
+        scaler.unscale_(optim_g)
+        if amp_enabled:
+            torch.nn.utils.clip_grad_norm_(parameters=net_g_params, max_norm=500)
+        if log_this_step:
+            grad_norm_g = commons.clip_grad_value_(net_g_params, None)
+        scaler.step(optim_g)
+        optim_g.zero_grad(set_to_none=True)
         scaler.update()
 
         if rank == 0:
