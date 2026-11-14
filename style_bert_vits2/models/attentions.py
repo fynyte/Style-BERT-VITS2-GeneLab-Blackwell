@@ -10,9 +10,7 @@ from style_bert_vits2.models import commons
 
 
 def _assert_finite(tensor: Optional[torch.Tensor], name: str) -> None:
-    """[fp16 debug] NaN/Inf の発生源を特定するための一時的な診断ヘルパー。
-    問題箇所が判明したら削除して構わない。models_jp_extra.py の同名関数と重複しているが、
-    循環importを避けるためここでも定義している。"""
+    """[fp16 debug] NaN/Inf の発生源を特定するための一時的な診断ヘルパー。"""
     if tensor is None:
         return
     if not torch.isfinite(tensor).all():
@@ -79,11 +77,6 @@ class Encoder(nn.Module):
         self.kernel_size = kernel_size
         self.p_dropout = p_dropout
         self.window_size = window_size
-        # if isflow:
-        #  cond_layer = torch.nn.Conv1d(256, 2*hidden_channels*n_layers, 1)
-        #  self.cond_pre = torch.nn.Conv1d(hidden_channels, 2*hidden_channels, 1)
-        #  self.cond_layer = weight_norm(cond_layer, name='weight')
-        #  self.gin_channels = 256
         self.cond_layer_idx = self.n_layers
         if "gin_channels" in kwargs:
             self.gin_channels = kwargs["gin_channels"]
@@ -93,7 +86,6 @@ class Encoder(nn.Module):
                 self.cond_layer_idx = (
                     kwargs["cond_layer_idx"] if "cond_layer_idx" in kwargs else 2
                 )
-                # logger.debug(self.gin_channels, self.cond_layer_idx)
                 assert (
                     self.cond_layer_idx < self.n_layers
                 ), "cond_layer_idx should be less than n_layers"
@@ -127,11 +119,6 @@ class Encoder(nn.Module):
     def forward(
         self, x: torch.Tensor, x_mask: torch.Tensor, g: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
-        # [fp16 debug] 診断チェックはfp16実行時のみ発動させる(CUDA同期を伴うため
-        # bf16/fp32実行時には余計なオーバーヘッドになる)。
-        fp16_active = (
-            torch.is_autocast_enabled() and torch.get_autocast_gpu_dtype() == torch.float16
-        )
         attn_mask = x_mask.unsqueeze(2) * x_mask.unsqueeze(-1)
         x = x * x_mask
         for i in range(self.n_layers):
@@ -142,20 +129,12 @@ class Encoder(nn.Module):
                 x = x + g
                 x = x * x_mask
             y = self.attn_layers[i](x, x, attn_mask)
-            if fp16_active:
-                _assert_finite(y, f"encoder layer {i} attn output")
             y = self.drop(y)
             x = self.norm_layers_1[i](x + y)
-            if fp16_active:
-                _assert_finite(x, f"encoder layer {i} post-norm1")
 
             y = self.ffn_layers[i](x, x_mask)
-            if fp16_active:
-                _assert_finite(y, f"encoder layer {i} ffn output")
             y = self.drop(y)
             x = self.norm_layers_2[i](x + y)
-            if fp16_active:
-                _assert_finite(x, f"encoder layer {i} post-norm2")
         x = x * x_mask
         return x
 
@@ -334,7 +313,8 @@ class MultiHeadAttention(nn.Module):
         value = value.view(b, self.n_heads, self.k_channels, t_s).transpose(2, 3)
 
         def _compute_scores(q: torch.Tensor, k: torch.Tensor) -> torch.Tensor:
-            scores = torch.matmul(q / math.sqrt(self.k_channels), k.transpose(-2, -1))
+            q_scaled = q / math.sqrt(self.k_channels)
+            scores = torch.matmul(q_scaled, k.transpose(-2, -1))
             if self.window_size is not None:
                 assert (
                     t_s == t_t
@@ -343,7 +323,7 @@ class MultiHeadAttention(nn.Module):
                     self.emb_rel_k, t_s
                 )
                 rel_logits = self._matmul_with_relative_keys(
-                    q / math.sqrt(self.k_channels),
+                    q_scaled,
                     key_relative_embeddings.to(q.dtype),
                 )
                 scores_local = self._relative_position_to_absolute_position(rel_logits)
@@ -367,18 +347,14 @@ class MultiHeadAttention(nn.Module):
                     scores = scores.masked_fill(block_mask == 0, -1e4)
             return scores
 
-        # [fp16 debug / fix] 生のQK^Tスコア計算・相対位置バイアスの加算はfp16 autocast下で
-        # 容易にオーバーフローするため(Flash Attention等の融合カーネルと違い、
-        # ここは手書きのmatmul実装で内部の数値安定化がない)、明示的にfp32で計算する。
-        # bf16/fp32実行時はこの介入自体が不要かつ余計なコストになるため、
-        # fp16が実際に有効な場合のみ発動させ、それ以外は元の実装と完全に同じ経路を通す。
+        # 生のQK^Tスコア計算・相対位置バイアスの加算はfp16 autocast下で
+        # 容易にオーバーフローするため、fp16が有効な場合のみ明示的にfp32で計算する。
         fp16_active = (
             torch.is_autocast_enabled() and torch.get_autocast_gpu_dtype() == torch.float16
         )
         if fp16_active:
             with autocast(enabled=False):
                 scores = _compute_scores(query.float(), key.float())
-                _assert_finite(scores, "attention scores (pre-softmax)")
                 p_attn = F.softmax(scores, dim=-1)  # [b, n_h, t_t, t_s]
         else:
             scores = _compute_scores(query, key)
@@ -424,7 +400,6 @@ class MultiHeadAttention(nn.Module):
         self, relative_embeddings: torch.Tensor, length: int
     ) -> torch.Tensor:
         assert self.window_size is not None
-        2 * self.window_size + 1  # type: ignore
         # Pad first before slice to avoid using cond ops.
         pad_length = max(length - (self.window_size + 1), 0)
         slice_start_position = max((self.window_size + 1) - length, 0)
@@ -432,7 +407,7 @@ class MultiHeadAttention(nn.Module):
         if pad_length > 0:
             padded_relative_embeddings = F.pad(
                 relative_embeddings,
-                commons.convert_pad_shape([[0, 0], [pad_length, pad_length], [0, 0]]),
+                (0, 0, pad_length, pad_length, 0, 0),
             )
         else:
             padded_relative_embeddings = relative_embeddings
@@ -448,13 +423,11 @@ class MultiHeadAttention(nn.Module):
         """
         batch, heads, length, _ = x.size()
         # Concat columns of pad to shift from relative to absolute indexing.
-        x = F.pad(x, commons.convert_pad_shape([[0, 0], [0, 0], [0, 0], [0, 1]]))
+        x = F.pad(x, (0, 1))
 
         # Concat extra elements so to add up to shape (len+1, 2*len-1).
         x_flat = x.view([batch, heads, length * 2 * length])
-        x_flat = F.pad(
-            x_flat, commons.convert_pad_shape([[0, 0], [0, 0], [0, length - 1]])
-        )
+        x_flat = F.pad(x_flat, (0, length - 1))
 
         # Reshape and slice out the padded elements.
         x_final = x_flat.view([batch, heads, length + 1, 2 * length - 1])[
@@ -469,12 +442,10 @@ class MultiHeadAttention(nn.Module):
         """
         batch, heads, length, _ = x.size()
         # pad along column
-        x = F.pad(
-            x, commons.convert_pad_shape([[0, 0], [0, 0], [0, 0], [0, length - 1]])
-        )
+        x = F.pad(x, (0, length - 1))
         x_flat = x.view([batch, heads, length**2 + length * (length - 1)])
         # add 0's in the beginning that will skew the elements after reshape
-        x_flat = F.pad(x_flat, commons.convert_pad_shape([[0, 0], [0, 0], [length, 0]]))
+        x_flat = F.pad(x_flat, (length, 0))
         x_final = x_flat.view([batch, heads, length, 2 * length])[:, :, :, 1:]
         return x_final
 
@@ -511,8 +482,10 @@ class FFN(nn.Module):
         self.causal = causal
 
         if causal:
+            self.pad_shape = (kernel_size - 1, 0)
             self.padding = self._causal_padding
         else:
+            self.pad_shape = ((kernel_size - 1) // 2, kernel_size // 2)
             self.padding = self._same_padding
 
         self.conv_1 = nn.Conv1d(in_channels, filter_channels, kernel_size)
@@ -532,17 +505,9 @@ class FFN(nn.Module):
     def _causal_padding(self, x: torch.Tensor) -> torch.Tensor:
         if self.kernel_size == 1:
             return x
-        pad_l = self.kernel_size - 1
-        pad_r = 0
-        padding = [[0, 0], [0, 0], [pad_l, pad_r]]
-        x = F.pad(x, commons.convert_pad_shape(padding))
-        return x
+        return F.pad(x, self.pad_shape)
 
     def _same_padding(self, x: torch.Tensor) -> torch.Tensor:
         if self.kernel_size == 1:
             return x
-        pad_l = (self.kernel_size - 1) // 2
-        pad_r = self.kernel_size // 2
-        padding = [[0, 0], [0, 0], [pad_l, pad_r]]
-        x = F.pad(x, commons.convert_pad_shape(padding))
-        return x
+        return F.pad(x, self.pad_shape)

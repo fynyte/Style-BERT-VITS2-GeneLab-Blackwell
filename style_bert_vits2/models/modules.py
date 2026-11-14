@@ -154,6 +154,7 @@ class WN(torch.nn.Module):
         self.n_layers = n_layers
         self.gin_channels = gin_channels
         self.p_dropout = p_dropout
+        self._n_channels_tensor = torch.IntTensor([hidden_channels])
 
         self.in_layers = torch.nn.ModuleList()
         self.res_skip_layers = torch.nn.ModuleList()
@@ -195,8 +196,8 @@ class WN(torch.nn.Module):
         g: Optional[torch.Tensor] = None,
         **kwargs: Any,
     ) -> torch.Tensor:
-        output = torch.zeros_like(x)
-        n_channels_tensor = torch.IntTensor([self.hidden_channels])
+        output: Optional[torch.Tensor] = None
+        n_channels_tensor = self._n_channels_tensor
 
         if g is not None:
             g = self.cond_layer(g)
@@ -216,9 +217,11 @@ class WN(torch.nn.Module):
             if i < self.n_layers - 1:
                 res_acts = res_skip_acts[:, : self.hidden_channels, :]
                 x = (x + res_acts) * x_mask
-                output = output + res_skip_acts[:, self.hidden_channels :, :]
+                skip_acts = res_skip_acts[:, self.hidden_channels :, :]
+                output = skip_acts.to(x.dtype) if output is None else output + skip_acts
             else:
-                output = output + res_skip_acts
+                output = res_skip_acts.to(x.dtype) if output is None else output + res_skip_acts
+        assert output is not None
         return output * x_mask
 
     def remove_weight_norm(self) -> None:
@@ -313,18 +316,23 @@ class ResBlock1(torch.nn.Module):
     def forward(
         self, x: torch.Tensor, x_mask: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
+        if x_mask is None:
+            for c1, c2 in zip(self.convs1, self.convs2):
+                xt = F.leaky_relu(x, LRELU_SLOPE)
+                xt = c1(xt)
+                xt = F.leaky_relu(xt, LRELU_SLOPE, inplace=True)
+                xt = c2(xt)
+                x = xt + x
+            return x
         for c1, c2 in zip(self.convs1, self.convs2):
             xt = F.leaky_relu(x, LRELU_SLOPE)
-            if x_mask is not None:
-                xt = xt * x_mask
+            xt = xt * x_mask
             xt = c1(xt)
-            xt = F.leaky_relu(xt, LRELU_SLOPE)
-            if x_mask is not None:
-                xt = xt * x_mask
+            xt = F.leaky_relu(xt, LRELU_SLOPE, inplace=True)
+            xt = xt * x_mask
             xt = c2(xt)
             x = xt + x
-        if x_mask is not None:
-            x = x * x_mask
+        x = x * x_mask
         return x
 
     def remove_weight_norm(self) -> None:
@@ -410,7 +418,7 @@ class Flip(nn.Module):
     ) -> Union[tuple[torch.Tensor, torch.Tensor], torch.Tensor]:
         x = torch.flip(x, [1])
         if not reverse:
-            logdet = torch.zeros(x.size(0)).to(dtype=x.dtype, device=x.device)
+            logdet = torch.zeros(x.size(0), dtype=x.dtype, device=x.device)
             return x, logdet
         else:
             return x
@@ -522,6 +530,7 @@ class ConvFlow(nn.Module):
         self.num_bins = num_bins
         self.tail_bound = tail_bound
         self.half_channels = in_channels // 2
+        self.inv_sqrt_filter = filter_channels**-0.5
 
         self.pre = nn.Conv1d(self.half_channels, filter_channels, 1)
         self.convs = DDSConv(filter_channels, kernel_size, n_layers, p_dropout=0.0)

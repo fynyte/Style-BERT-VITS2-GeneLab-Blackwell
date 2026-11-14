@@ -13,8 +13,7 @@ from style_bert_vits2.nlp.symbols import NUM_LANGUAGES, NUM_TONES, SYMBOLS
 
 
 def _assert_finite(tensor: Optional[torch.Tensor], name: str) -> None:
-    """[fp16 debug] NaN/Inf の発生源を特定するための一時的な診断ヘルパー。
-    問題箇所が判明したら削除して構わない。"""
+    """[fp16 debug] NaN/Inf の発生源を特定するための一時的な診断ヘルパー。"""
     if tensor is None:
         return
     if not torch.isfinite(tensor).all():
@@ -133,21 +132,7 @@ class TransformerCouplingBlock(nn.Module):
 
         self.flows = nn.ModuleList()
 
-        self.wn = (
-            # attentions.FFT(
-            #     hidden_channels,
-            #     filter_channels,
-            #     n_heads,
-            #     n_layers,
-            #     kernel_size,
-            #     p_dropout,
-            #     isflow=True,
-            #     gin_channels=self.gin_channels,
-            # )
-            None
-            if share_parameter
-            else None
-        )
+        self.wn = None if share_parameter else None
 
         for i in range(n_flows):
             self.flows.append(
@@ -261,8 +246,9 @@ class StochasticDurationPredictor(nn.Module):
                 * x_mask
             )
             z_q = e_q
+            cond_q = x + h_w
             for flow in self.post_flows:
-                z_q, logdet_q = flow(z_q, x_mask, g=(x + h_w))
+                z_q, logdet_q = flow(z_q, x_mask, g=cond_q)
                 logdet_tot_q += logdet_q
             z_u, z1 = torch.split(z_q, [1, 1], 1)
             u = torch.sigmoid(z_u) * x_mask
@@ -616,7 +602,7 @@ class Generator(torch.nn.Module):
             x = x + self.cond(g)
 
         for i in range(self.num_upsamples):
-            x = F.leaky_relu(x, modules.LRELU_SLOPE)
+            x = F.leaky_relu(x, modules.LRELU_SLOPE, inplace=True)
             x = self.ups[i](x)
             xs = None
             for j in range(self.num_kernels):
@@ -626,7 +612,7 @@ class Generator(torch.nn.Module):
                     xs += self.resblocks[i * self.num_kernels + j](x)
             assert xs is not None
             x = xs / self.num_kernels
-        x = F.leaky_relu(x)
+        x = F.leaky_relu(x, inplace=True)
         x = self.conv_post(x)
         x = torch.tanh(x)
 
@@ -703,8 +689,10 @@ class DiscriminatorP(torch.nn.Module):
         )
         self.conv_post = norm_f(Conv2d(1024, 1, (3, 1), 1, padding=(1, 0)))
 
-    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, list[torch.Tensor]]:
-        fmap = []
+    def forward(
+        self, x: torch.Tensor, include_fmap: bool = True
+    ) -> tuple[torch.Tensor, list[torch.Tensor]]:
+        fmap: list[torch.Tensor] = []
 
         # 1d to 2d
         b, c, t = x.shape
@@ -716,10 +704,12 @@ class DiscriminatorP(torch.nn.Module):
 
         for layer in self.convs:
             x = layer(x)
-            x = F.leaky_relu(x, modules.LRELU_SLOPE)
-            fmap.append(x)
+            x = F.leaky_relu(x, modules.LRELU_SLOPE, inplace=True)
+            if include_fmap:
+                fmap.append(x)
         x = self.conv_post(x)
-        fmap.append(x)
+        if include_fmap:
+            fmap.append(x)
         x = torch.flatten(x, 1, -1)
 
         return x, fmap
@@ -741,15 +731,19 @@ class DiscriminatorS(torch.nn.Module):
         )
         self.conv_post = norm_f(Conv1d(1024, 1, 3, 1, padding=1))
 
-    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, list[torch.Tensor]]:
-        fmap = []
+    def forward(
+        self, x: torch.Tensor, include_fmap: bool = True
+    ) -> tuple[torch.Tensor, list[torch.Tensor]]:
+        fmap: list[torch.Tensor] = []
 
         for layer in self.convs:
             x = layer(x)
-            x = F.leaky_relu(x, modules.LRELU_SLOPE)
-            fmap.append(x)
+            x = F.leaky_relu(x, modules.LRELU_SLOPE, inplace=True)
+            if include_fmap:
+                fmap.append(x)
         x = self.conv_post(x)
-        fmap.append(x)
+        if include_fmap:
+            fmap.append(x)
         x = torch.flatten(x, 1, -1)
 
         return x, fmap
@@ -770,6 +764,7 @@ class MultiPeriodDiscriminator(torch.nn.Module):
         self,
         y: torch.Tensor,
         y_hat: torch.Tensor,
+        include_fmap: bool = True,
     ) -> tuple[
         list[torch.Tensor], list[torch.Tensor], list[torch.Tensor], list[torch.Tensor]
     ]:
@@ -777,13 +772,19 @@ class MultiPeriodDiscriminator(torch.nn.Module):
         y_d_gs = []
         fmap_rs = []
         fmap_gs = []
-        for i, d in enumerate(self.discriminators):
-            y_d_r, fmap_r = d(y)
-            y_d_g, fmap_g = d(y_hat)
+        no_grad_real = y_hat.requires_grad and not y.requires_grad
+        for d in self.discriminators:
+            if no_grad_real:
+                with torch.no_grad():
+                    y_d_r, fmap_r = d(y, include_fmap=include_fmap)
+            else:
+                y_d_r, fmap_r = d(y, include_fmap=include_fmap)
+            y_d_g, fmap_g = d(y_hat, include_fmap=include_fmap)
             y_d_rs.append(y_d_r)
             y_d_gs.append(y_d_g)
-            fmap_rs.append(fmap_r)
-            fmap_gs.append(fmap_g)
+            if include_fmap:
+                fmap_rs.append(fmap_r)
+                fmap_gs.append(fmap_g)
 
         return y_d_rs, y_d_gs, fmap_rs, fmap_gs
 
@@ -830,11 +831,9 @@ class WavLMDiscriminator(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.pre(x)
 
-        fmap = []
         for l in self.convs:
             x = l(x)
-            x = F.leaky_relu(x, modules.LRELU_SLOPE)
-            fmap.append(x)
+            x = F.leaky_relu(x, modules.LRELU_SLOPE, inplace=True)
         x = self.conv_post(x)
         x = torch.flatten(x, 1, -1)
 
@@ -866,7 +865,6 @@ class ReferenceEncoder(nn.Module):
             for i in range(K)
         ]
         self.convs = nn.ModuleList(convs)
-        # self.wns = nn.ModuleList([weight_norm(num_features=ref_enc_filters[i]) for i in range(K)])
 
         out_channels = self.calculate_channels(spec_channels, 3, 2, 1, K)
         self.gru = nn.GRU(
@@ -883,8 +881,7 @@ class ReferenceEncoder(nn.Module):
         out = inputs.view(N, 1, -1, self.spec_channels)  # [N, 1, Ty, n_freqs]
         for conv in self.convs:
             out = conv(out)
-            # out = wn(out)
-            out = F.relu(out)  # [N, 128, Ty//2^K, n_mels//2^K]
+            out = F.relu(out, inplace=True)  # [N, 128, Ty//2^K, n_mels//2^K]
 
         out = out.transpose(1, 2)  # [N, Ty//2^K, 128, n_mels//2^K]
         T = out.size(1)
@@ -1095,25 +1092,12 @@ class SynthesizerTrn(nn.Module):
 
         w = attn.sum(2)
 
-        # [fp16 debug / fix] fp16実行時のみ、self.sdp をfp32で計算し診断チェックも行う。
-        # bf16/fp32実行時はこの介入は不要かつ余計なコストになるため、元の実装のまま通す。
+        # StochasticDurationPredictor は正規化フロー内部で exp/log を多用するため、
+        # fp16 autocast 下のみ明示的に fp32 で計算する。
         fp16_active = (
             torch.is_autocast_enabled() and torch.get_autocast_gpu_dtype() == torch.float16
         )
         if fp16_active:
-            # self.sdp に渡る直前の時点で x/x_mask/w/g が既に壊れていないか確認する。
-            # ここで例外が出れば「self.sdpより手前(エンコーダ等)で既にNaN/Infが発生している」と確定する。
-            # ここを通過して尚 self.sdp 内部でクラッシュする場合は、fp32化しても直らない
-            # 何か別の原因(事前学習チェックポイント自体の破損等)を疑う必要がある。
-            _assert_finite(x, "x (pre-sdp)")
-            _assert_finite(x_mask, "x_mask (pre-sdp)")
-            _assert_finite(w, "w (pre-sdp)")
-            _assert_finite(g, "g (pre-sdp)")
-
-            # StochasticDurationPredictor は正規化フロー内部で exp/log を多用するため、
-            # fp16 autocast 下だと極端な値が容易に inf/NaN 化し、後段の
-            # rational_quadratic_spline で「入力が空集合」エラーを誘発する。
-            # 生成器全体のfp16化とは切り離し、このサブモジュールだけ明示的にfp32で計算する。
             with autocast(enabled=False):
                 l_length_sdp = self.sdp(
                     x.float(),
@@ -1123,15 +1107,12 @@ class SynthesizerTrn(nn.Module):
                 )
         else:
             l_length_sdp = self.sdp(x, x_mask, w, g=g)
-        l_length_sdp = l_length_sdp / torch.sum(x_mask)
+        x_mask_sum = torch.sum(x_mask)
+        l_length_sdp = l_length_sdp / x_mask_sum
 
         logw_ = torch.log(w + 1e-6) * x_mask
         logw = self.dp(x, x_mask, g=g)
-        # logw_sdp = self.sdp(x, x_mask, g=g, reverse=True, noise_scale=1.0)
-        l_length_dp = torch.sum((logw - logw_) ** 2, [1, 2]) / torch.sum(
-            x_mask
-        )  # for averaging
-        # l_length_sdp += torch.sum((logw_sdp - logw_) ** 2, [1, 2]) / torch.sum(x_mask)
+        l_length_dp = torch.sum((logw - logw_) ** 2, [1, 2]) / x_mask_sum
 
         l_length = l_length_dp + l_length_sdp
 
@@ -1174,8 +1155,6 @@ class SynthesizerTrn(nn.Module):
         sdp_ratio: float = 0.0,
         y: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, tuple[torch.Tensor, ...]]:
-        # x, m_p, logs_p, x_mask = self.enc_p(x, x_lengths, tone, language, bert)
-        # g = self.gst(y)
         if self.n_speakers > 0:
             g = self.emb_g(sid).unsqueeze(-1)  # [b, h, 1]
         else:
@@ -1184,7 +1163,6 @@ class SynthesizerTrn(nn.Module):
         x, m_p, logs_p, x_mask = self.enc_p(
             x, x_lengths, tone, language, bert, style_vec, g=g
         )
-        # 学習時と同じ理由で、推論時もfp16実行時のみこのサブモジュールをfp32で計算する。
         infer_fp16_active = (
             torch.is_autocast_enabled() and torch.get_autocast_gpu_dtype() == torch.float16
         )

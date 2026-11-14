@@ -52,9 +52,7 @@ class TextAudioSpeakerLoader(torch.utils.data.Dataset):
         self.max_text_len = getattr(hparams, "max_text_len", 384)
 
         # __init__時に全サンプルをメモリへプリロードするかどうか。
-        # HyperParametersData 側に preload_all_to_memory が無い場合は False 扱い。
         self.preload_all_to_memory = getattr(
-            #hparams, "preload_all_to_memory", False
             hparams, "preload_all_to_memory", True
         )
         self.cache: list = []
@@ -70,10 +68,6 @@ class TextAudioSpeakerLoader(torch.utils.data.Dataset):
         """
         Filter text & store spec lengths
         """
-        # Store spectrogram lengths for Bucketing
-        # wav_length ~= file_size / (wav_channels * Bytes per dim) = file_size / (1 * 2)
-        # spec_length = wav_length // hop_length
-
         audiopaths_sid_text_new = []
         lengths = []
         skipped = 0
@@ -82,7 +76,6 @@ class TextAudioSpeakerLoader(torch.utils.data.Dataset):
             self.audiopaths_sid_text, file=sys.stdout, dynamic_ncols=True
         ):
             audiopath = f"{_id}"
-            # if self.min_text_len <= len(phones) and len(phones) <= self.max_text_len:
             phones = phones.split(" ")
             tone = [int(i) for i in tone.split(" ")]
             word2ph = [int(i) for i in word2ph.split(" ")]
@@ -90,8 +83,6 @@ class TextAudioSpeakerLoader(torch.utils.data.Dataset):
                 [audiopath, spk, language, text, phones, tone, word2ph]
             )
             lengths.append(os.path.getsize(audiopath) // (2 * self.hop_length))
-            # else:
-            #     skipped += 1
         logger.info(
             "skipped: "
             + str(skipped)
@@ -105,7 +96,6 @@ class TextAudioSpeakerLoader(torch.utils.data.Dataset):
         """
         __init__時に全サンプル（音声・スペクトログラム・BERT特徴量・スタイルベクトル）を
         あらかじめデシリアライズしてメモリ上のリストに保持しておく。
-        これにより __getitem__ 時のファイルI/O・torch.load/np.loadのデコードコストがなくなる。
         """
         logger.info("Preloading all samples into memory (this may take a while)...")
         self.cache = [None] * len(self.audiopaths_sid_text)
@@ -125,12 +115,6 @@ class TextAudioSpeakerLoader(torch.utils.data.Dataset):
         )
 
     def _load_sample(self, audiopath_sid_text):
-        """
-        1サンプル分を実際にディスク（または /dev/shm 等）から読み込み、
-        get_audio_text_speaker_pair が返すのと同じ形式のタプルを構築する。
-        通常の都度読み込みとプリロード（_preload）の両方から呼ばれる共通処理。
-        """
-        # separate filename, speaker_id and text
         audiopath, sid, language, text, phones, tone, word2ph = audiopath_sid_text
 
         bert, ja_bert, en_bert, phones, tone, language = self.get_text(
@@ -139,7 +123,7 @@ class TextAudioSpeakerLoader(torch.utils.data.Dataset):
 
         spec, wav = self.get_audio(audiopath)
         sid = torch.LongTensor([int(self.spk_map[sid])])
-        style_vec = torch.FloatTensor(np.load(f"{audiopath}.npy"))
+        style_vec = torch.from_numpy(np.load(f"{audiopath}.npy")).float()
         if self.use_jp_extra:
             return (phones, spec, wav, sid, tone, language, ja_bert, style_vec)
         else:
@@ -157,12 +141,10 @@ class TextAudioSpeakerLoader(torch.utils.data.Dataset):
             )
 
     def get_audio_text_speaker_pair(self, audiopath_sid_text, index=None):
-        # プリロード済みキャッシュがあればそれを返す（ファイルI/O・デコードを省略）
         if self.preload_all_to_memory and index is not None:
             cached = self.cache[index]
             if cached is not None:
                 return cached
-            # プリロードに失敗していたサンプルはここで都度読み込みにフォールバック
         return self._load_sample(audiopath_sid_text)
 
     def get_audio(self, filename):
@@ -171,8 +153,7 @@ class TextAudioSpeakerLoader(torch.utils.data.Dataset):
             raise ValueError(
                 f"{filename} {sampling_rate} SR doesn't match target {self.sampling_rate} SR"
             )
-        audio_norm = audio / self.max_wav_value
-        audio_norm = audio_norm.unsqueeze(0)
+        audio_norm = (audio / self.max_wav_value).unsqueeze(0)
         spec_filename = filename.replace(".wav", ".spec.pt")
         if self.use_mel_spec_posterior:
             spec_filename = spec_filename.replace(".spec.pt", ".mel.pt")
@@ -222,7 +203,15 @@ class TextAudioSpeakerLoader(torch.utils.data.Dataset):
             logger.warning("Bert load Failed")
             logger.warning(e)
 
-        if language_str == "ZH":
+        if self.use_jp_extra:
+            bert = None
+            en_bert = None
+            ja_bert = (
+                bert_ori
+                if language_str == "JP"
+                else torch.zeros(1024, len(phone), dtype=torch.float32)
+            )
+        elif language_str == "ZH":
             bert = bert_ori
             ja_bert = torch.zeros(1024, len(phone))
             en_bert = torch.zeros(1024, len(phone))
@@ -265,44 +254,39 @@ class TextAudioSpeakerCollate:
         ------
         batch: [text_normalized, spec_normalized, wav_normalized, sid]
         """
-        # Right zero-pad all one-hot text sequences to max input length
+        n_batch = len(batch)
         _, ids_sorted_decreasing = torch.sort(
             torch.LongTensor([x[1].size(1) for x in batch]), dim=0, descending=True
         )
 
-        max_text_len = max([len(x[0]) for x in batch])
-        max_spec_len = max([x[1].size(1) for x in batch])
-        max_wav_len = max([x[2].size(1) for x in batch])
+        max_text_len = max(len(x[0]) for x in batch)
+        max_spec_len = max(x[1].size(1) for x in batch)
+        max_wav_len = max(x[2].size(1) for x in batch)
 
-        text_lengths = torch.LongTensor(len(batch))
-        spec_lengths = torch.LongTensor(len(batch))
-        wav_lengths = torch.LongTensor(len(batch))
-        sid = torch.LongTensor(len(batch))
+        text_lengths = torch.empty(n_batch, dtype=torch.long)
+        spec_lengths = torch.empty(n_batch, dtype=torch.long)
+        wav_lengths = torch.empty(n_batch, dtype=torch.long)
+        sid = torch.empty(n_batch, dtype=torch.long)
 
-        text_padded = torch.LongTensor(len(batch), max_text_len)
-        tone_padded = torch.LongTensor(len(batch), max_text_len)
-        language_padded = torch.LongTensor(len(batch), max_text_len)
-        # This is ZH bert if not use_jp_extra, JA bert if use_jp_extra
-        bert_padded = torch.FloatTensor(len(batch), 1024, max_text_len)
+        text_padded = torch.zeros((n_batch, max_text_len), dtype=torch.long)
+        tone_padded = torch.zeros((n_batch, max_text_len), dtype=torch.long)
+        language_padded = torch.zeros((n_batch, max_text_len), dtype=torch.long)
+        bert_padded = torch.zeros((n_batch, 1024, max_text_len), dtype=torch.float32)
         if not self.use_jp_extra:
-            ja_bert_padded = torch.FloatTensor(len(batch), 1024, max_text_len)
-            en_bert_padded = torch.FloatTensor(len(batch), 1024, max_text_len)
-        style_vec = torch.FloatTensor(len(batch), 256)
+            ja_bert_padded = torch.zeros(
+                (n_batch, 1024, max_text_len), dtype=torch.float32
+            )
+            en_bert_padded = torch.zeros(
+                (n_batch, 1024, max_text_len), dtype=torch.float32
+            )
+        style_vec = torch.empty((n_batch, 256), dtype=torch.float32)
 
-        spec_padded = torch.FloatTensor(len(batch), batch[0][1].size(0), max_spec_len)
-        wav_padded = torch.FloatTensor(len(batch), 1, max_wav_len)
-        text_padded.zero_()
-        tone_padded.zero_()
-        language_padded.zero_()
-        spec_padded.zero_()
-        wav_padded.zero_()
-        bert_padded.zero_()
-        if not self.use_jp_extra:
-            ja_bert_padded.zero_()
-            en_bert_padded.zero_()
-        style_vec.zero_()
+        spec_padded = torch.zeros(
+            (n_batch, batch[0][1].size(0), max_spec_len), dtype=torch.float32
+        )
+        wav_padded = torch.zeros((n_batch, 1, max_wav_len), dtype=torch.float32)
 
-        for i in range(len(ids_sorted_decreasing)):
+        for i in range(n_batch):
             row = batch[ids_sorted_decreasing[i]]
 
             text = row[0]
@@ -374,10 +358,6 @@ class DistributedBucketSampler(torch.utils.data.distributed.DistributedSampler):
     """
     Maintain similar input lengths in a batch.
     Length groups are specified by boundaries.
-    Ex) boundaries = [b1, b2, b3] -> any batch is included either {x | b1 < length(x) <=b2} or {x | b2 < length(x) <= b3}.
-
-    It removes samples which are not included in the boundaries.
-    Ex) boundaries = [b1, b2, b3] -> any x s.t. length(x) <= b1 or length(x) > b3 are discarded.
     """
 
     def __init__(
@@ -396,11 +376,6 @@ class DistributedBucketSampler(torch.utils.data.distributed.DistributedSampler):
 
         self.buckets, self.num_samples_per_bucket = self._create_buckets()
         logger.info(f"Bucket info: {self.num_samples_per_bucket}")
-        # logger.info(
-        #     f"Unused samples: {len(self.lengths) - sum(self.num_samples_per_bucket)}"
-        # )
-        # ↑マイナスになることあるし、別にこれは使われないサンプル数ではないようだ……
-        # バケットの仕組みはよく分からない
 
         self.total_size = sum(self.num_samples_per_bucket)
         self.num_samples = self.total_size // self.num_replicas
@@ -419,7 +394,6 @@ class DistributedBucketSampler(torch.utils.data.distributed.DistributedSampler):
                     buckets.pop(i)
                     self.boundaries.pop(i + 1)
             assert all(len(bucket) > 0 for bucket in buckets)
-        # When one bucket is not traversed
         except Exception as e:
             logger.info("Bucket warning ", e)
             for i in range(len(buckets) - 1, -1, -1):
@@ -438,7 +412,6 @@ class DistributedBucketSampler(torch.utils.data.distributed.DistributedSampler):
         return buckets, num_samples_per_bucket
 
     def __iter__(self):
-        # deterministically shuffle based on epoch
         g = torch.Generator()
         g.manual_seed(self.epoch)
 
@@ -459,7 +432,6 @@ class DistributedBucketSampler(torch.utils.data.distributed.DistributedSampler):
             ids_bucket = indices[i]
             num_samples_bucket = self.num_samples_per_bucket[i]
 
-            # add extra samples to make it evenly divisible
             rem = num_samples_bucket - len_bucket
             ids_bucket = (
                 ids_bucket
@@ -467,10 +439,8 @@ class DistributedBucketSampler(torch.utils.data.distributed.DistributedSampler):
                 + ids_bucket[: (rem % len_bucket)]
             )
 
-            # subsample
             ids_bucket = ids_bucket[self.rank :: self.num_replicas]
 
-            # batching
             for j in range(len(ids_bucket) // self.batch_size):
                 batch = [
                     bucket[idx]

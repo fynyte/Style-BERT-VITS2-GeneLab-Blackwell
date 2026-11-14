@@ -1,3 +1,4 @@
+import math
 from typing import Optional
 
 import numpy as np
@@ -7,6 +8,7 @@ from torch.nn import functional as F
 DEFAULT_MIN_BIN_WIDTH = 1e-3
 DEFAULT_MIN_BIN_HEIGHT = 1e-3
 DEFAULT_MIN_DERIVATIVE = 1e-3
+_DEFAULT_DERIVATIVE_CONSTANT = math.log(math.exp(1.0 - DEFAULT_MIN_DERIVATIVE) - 1.0)
 
 
 def piecewise_rational_quadratic_transform(
@@ -74,16 +76,16 @@ def unconstrained_rational_quadratic_spline(
 ) -> tuple[torch.Tensor, torch.Tensor]:
 
     inside_interval_mask = (inputs >= -tail_bound) & (inputs <= tail_bound)
-    outside_interval_mask = ~inside_interval_mask
-
-    outputs = torch.zeros_like(inputs)
-    logabsdet = torch.zeros_like(inputs)
 
     if tails == "linear":
-        unnormalized_derivatives = F.pad(unnormalized_derivatives, pad=(1, 1))
-        constant = np.log(np.exp(1 - min_derivative) - 1)
-        unnormalized_derivatives[..., 0] = constant
-        unnormalized_derivatives[..., -1] = constant
+        constant = (
+            _DEFAULT_DERIVATIVE_CONSTANT
+            if min_derivative == DEFAULT_MIN_DERIVATIVE
+            else math.log(math.exp(1.0 - min_derivative) - 1.0)
+        )
+        unnormalized_derivatives = F.pad(
+            unnormalized_derivatives, pad=(1, 1), mode="constant", value=constant
+        )
 
         if use_dense:
             # Boolean indexing creates variable-sized tensors and synchronizes
@@ -111,6 +113,9 @@ def unconstrained_rational_quadratic_spline(
                 torch.where(inside_interval_mask, spline_logabsdet, 0.0),
             )
 
+        outside_interval_mask = ~inside_interval_mask
+        outputs = torch.zeros_like(inputs)
+        logabsdet = torch.zeros_like(inputs)
         outputs[outside_interval_mask] = inputs[outside_interval_mask]
         logabsdet[outside_interval_mask] = 0
     else:

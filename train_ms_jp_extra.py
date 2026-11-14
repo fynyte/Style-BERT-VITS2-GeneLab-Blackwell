@@ -70,64 +70,75 @@ class _CompactRelativeToAbsolute(torch.autograd.Function):
         length, width = x.shape[-2:]
         window = width // 2
         ctx.length, ctx.window = length, window
-        out = x.new_zeros(*x.shape[:-1], length)
-        for offset in range(-window, window + 1):
-            start, end = max(-offset, 0), min(length, length - offset)
-            out.diagonal(offset, dim1=-2, dim2=-1).copy_(
-                x[..., start:end, offset + window]
-            )
-        return out
+        if window == 0:
+            return torch.diag_embed(x.squeeze(-1))
+        buf = x.new_zeros(*x.shape[:-1], length + 2 * window)
+        band = buf.as_strided(
+            (*x.shape[:-1], 2 * window + 1),
+            (*buf.stride()[:-2], length + 2 * window + 1, 1),
+        )
+        band.copy_(x)
+        return buf[..., window : window + length]
 
     @staticmethod
     def backward(ctx, grad):
         length, window = ctx.length, ctx.window
-        out = grad.new_zeros(*grad.shape[:-1], 2 * window + 1)
-        for offset in range(-window, window + 1):
-            start, end = max(-offset, 0), min(length, length - offset)
-            out[..., start:end, offset + window].copy_(
-                grad.diagonal(offset, dim1=-2, dim2=-1)
-            )
-        return out
+        if window == 0:
+            return grad.diagonal(0, dim1=-2, dim2=-1).unsqueeze(-1).contiguous()
+        grad_pad = F.pad(grad, (window, window))
+        return grad_pad.as_strided(
+            (*grad.shape[:-1], 2 * window + 1),
+            (*grad_pad.stride()[:-2], length + 2 * window + 1, 1),
+        ).contiguous()
+
 
 class _CompactAbsoluteToRelative(torch.autograd.Function):
     """Gather the local diagonals used by relative values, including gradients."""
 
     @staticmethod
     def forward(ctx, x, window):
-        ctx.length, ctx.window = x.shape[-1], window
-        out = x.new_zeros(*x.shape[:-1], 2 * window + 1)
-        for offset in range(-window, window + 1):
-            start, end = max(-offset, 0), min(ctx.length, ctx.length - offset)
-            out[..., start:end, offset + window].copy_(
-                x.diagonal(offset, dim1=-2, dim2=-1)
-            )
-        return out
+        length = x.shape[-1]
+        ctx.length, ctx.window = length, window
+        if window == 0:
+            return x.diagonal(0, dim1=-2, dim2=-1).unsqueeze(-1).contiguous()
+        x_pad = F.pad(x, (window, window))
+        return x_pad.as_strided(
+            (*x.shape[:-1], 2 * window + 1),
+            (*x_pad.stride()[:-2], length + 2 * window + 1, 1),
+        ).contiguous()
 
     @staticmethod
     def backward(ctx, grad):
         length, window = ctx.length, ctx.window
-        out = grad.new_zeros(*grad.shape[:-1], length)
-        for offset in range(-window, window + 1):
-            start, end = max(-offset, 0), min(length, length - offset)
-            out.diagonal(offset, dim1=-2, dim2=-1).copy_(
-                grad[..., start:end, offset + window]
-            )
-        return out, None
+        if window == 0:
+            return torch.diag_embed(grad.squeeze(-1)), None
+        buf = grad.new_zeros(*grad.shape[:-1], length + 2 * window)
+        band = buf.as_strided(
+            (*grad.shape[:-1], 2 * window + 1),
+            (*buf.stride()[:-2], length + 2 * window + 1, 1),
+        )
+        band.copy_(grad)
+        return buf[..., window : window + length], None
+
 
 def _compact_relative_embeddings(module, embeddings, length):
     window = min(module.window_size, length - 1)
     return embeddings[:, module.window_size - window:module.window_size + window + 1]
 
+
 def _compact_relative_to_absolute(module, x):
     return _CompactRelativeToAbsolute.apply(x)
 
+
 def _compact_absolute_to_relative(module, x):
     return _CompactAbsoluteToRelative.apply(x, min(module.window_size, x.shape[-1] - 1))
+
 
 def _release_attention_reference(module, inputs, output):
     # The training graph retains what backward needs. No training code reads this
     # diagnostic attribute; keeping it also holds the previous batch's matrices.
     module.attn = None
+
 
 def _install_compact_relative_attention(net):
     count = 0
@@ -144,12 +155,17 @@ def _install_compact_relative_attention(net):
             count += 1
     return count
 
+
 def can_freeze_discriminator_for_generator(
     discriminator, *, use_spectral_norm, duration_discriminator=None,
     wavlm_discriminator=None, world_size=None,
 ):
     """Return false for configurations outside the numerically validated scope."""
-    if use_spectral_norm or duration_discriminator is not None or wavlm_discriminator is not None:
+    if (
+        use_spectral_norm
+        or duration_discriminator is not None
+        or wavlm_discriminator is not None
+    ):
         return False
     if world_size is not None and int(world_size) != 1:
         return False
@@ -163,6 +179,7 @@ def can_freeze_discriminator_for_generator(
         discriminator = discriminator.module
     # Check the actual legacy spectral-norm buffers as well as the config flag.
     return not any("weight_u" in module._buffers for module in discriminator.modules())
+
 
 @contextmanager
 def generator_discriminator_pass(
@@ -185,7 +202,10 @@ def generator_discriminator_pass(
         yield discriminator
         return
     module = discriminator.module if isinstance(discriminator, nn.parallel.DistributedDataParallel) else discriminator
-    parameters = tuple(module.parameters())
+    parameters = getattr(module, "_sbv2_cached_params", None)
+    if parameters is None:
+        parameters = tuple(module.parameters())
+        module._sbv2_cached_params = parameters
     flags = tuple(parameter.requires_grad for parameter in parameters)
     try:
         for parameter in parameters:
@@ -314,24 +334,6 @@ def run():
         with open(config.train_ms_config.config_path, "w", encoding="utf-8") as f:
             f.write(data)
 
-    """
-    Path constants are a bit complicated...
-    TODO: Refactor or rename these?
-    (Both `config.yml` and `config.json` are used, which is confusing I think.)
-
-    args.model: For saving all info needed for training.
-        default: `Data/{model_name}`.
-    hps.model_dir := model_dir: For saving checkpoints (for resuming training).
-        default: `Data/{model_name}/models`.
-        (Use `hps` since we have to pass `model_dir` to `train_and_evaluate()`.
-
-    args.assets_root: The root directory of model assets needed for inference.
-        default: config.assets_root == `model_assets`.
-
-    config.out_dir: The directory for model assets of this model (for inference).
-        default: `model_assets/{model_name}`.
-    """
-
     if args.repo_id is not None:
         # First try to upload config.json to check if the repo exists
         try:
@@ -372,8 +374,6 @@ def run():
     writer = None
     writer_eval = None
     if rank == 0 and not args.speedup:
-        # logger = utils.get_logger(hps.model_dir)
-        # logger.info(hps)
         utils.check_git_hash(model_dir)
         writer = SummaryWriter(log_dir=model_dir)
         writer_eval = SummaryWriter(log_dir=os.path.join(model_dir, "eval"))
@@ -390,17 +390,12 @@ def run():
         )
         train_loader = DataLoader(
             train_dataset,
-            # メモリ消費量を減らそうとnum_workersを1にしてみる
-            # num_workers=min(config.train_ms_config.num_workers, os.cpu_count() // 2),
             num_workers=1,
             shuffle=False,
             pin_memory=True,
             collate_fn=collate_fn,
             batch_sampler=train_sampler,
-            # batch_size=hps.train.batch_size,
             persistent_workers=True,
-            # これもメモリ消費量を減らそうとしてコメントアウト
-            # prefetch_factor=6,
         )
     else:
         train_sampler = DistributedLengthGroupedSampler(
@@ -413,17 +408,12 @@ def run():
         )
         train_loader = DataLoader(
             train_dataset,
-            # メモリ消費量を減らそうとnum_workersを1にしてみる
-            # num_workers=min(config.train_ms_config.num_workers, os.cpu_count() // 2),
             num_workers=1,
-            # shuffle=True,
             pin_memory=True,
             collate_fn=collate_fn,
             sampler=train_sampler,
             batch_size=hps.train.batch_size,
             persistent_workers=True,
-            # これもメモリ消費量を減らそうとしてコメントアウト
-            # prefetch_factor=6,
         )
         logger.info("Using DistributedLengthGroupedSampler for training.")
         logger.debug(f"len(train_dataset): {len(train_dataset)}")
@@ -482,7 +472,6 @@ def run():
         n_speakers=hps.data.n_speakers,
         mas_noise_scale_initial=mas_noise_scale_initial,
         noise_scale_delta=noise_scale_delta,
-        # hps.model 以下のすべての値を引数に渡す
         use_spk_conditioned_encoder=hps.model.use_spk_conditioned_encoder,
         use_noise_scaled_mas=hps.model.use_noise_scaled_mas,
         use_mel_posterior_encoder=hps.model.use_mel_posterior_encoder,
@@ -520,9 +509,9 @@ def run():
         for param in net_g.dec.parameters():
             param.requires_grad = False
 
-    if hps.train.bf16_run and not args.disable_bf16_optimizations:
+    if (hps.train.bf16_run or hps.train.fp16_run) and not args.disable_bf16_optimizations:
         relative_count = _install_compact_relative_attention(net_g)
-        logger.info(f"BF16 compact relative attention enabled: {relative_count} layers")
+        logger.info(f"Compact relative attention enabled: {relative_count} layers")
 
     if algorithm_optimizations:
         net_g.use_gather_prior = True
@@ -578,28 +567,24 @@ def run():
     net_g = DDP(
         net_g,
         device_ids=[local_rank],
-        # bucket_cap_mb=512
     )
     net_d = DDP(
         net_d,
         device_ids=[local_rank],
-        # bucket_cap_mb=512
     )
     if net_dur_disc is not None:
         net_dur_disc = DDP(
             net_dur_disc,
             device_ids=[local_rank],
-            # bucket_cap_mb=512,
         )
     if net_wd is not None:
         net_wd = DDP(
             net_wd,
             device_ids=[local_rank],
-            #  bucket_cap_mb=512
         )
 
     net_d._sbv2_freeze_for_generator = (
-        hps.train.bf16_run
+        (hps.train.bf16_run or hps.train.fp16_run)
         and not args.disable_bf16_optimizations
         and can_freeze_discriminator_for_generator(
             net_d, use_spectral_norm=hps.model.use_spectral_norm,
@@ -665,7 +650,6 @@ def run():
                 optim_d.param_groups[0]["initial_lr"] = d_resume_lr
 
             epoch_str = max(epoch_str, 1)
-            # global_step = (epoch_str - 1) * len(train_loader)
             global_step = int(
                 utils.get_steps(
                     utils.checkpoints.get_latest_checkpoint_path(model_dir, "G_*.pth")
@@ -708,11 +692,6 @@ def run():
             global_step = 0
 
     def lr_lambda(epoch):
-        """
-        Learning rate scheduler for warmup and exponential decay.
-        - During the warmup period, the learning rate increases linearly.
-        - After the warmup period, the learning rate decreases exponentially.
-        """
         if epoch < hps.train.warmup_epochs:
             return float(epoch) / float(max(1, hps.train.warmup_epochs))
         else:
@@ -754,8 +733,6 @@ def run():
         logger.info("Mixed precision training: fp16 (GradScaler enabled)")
     else:
         logger.info("Mixed precision training: disabled (fp32)")
-    # GradScaler は fp16 の勾配アンダーフロー対策としてのみ必要。
-    # bf16 は fp32 相当の指数レンジを持つため scaler は不要 (enabled=False で問題ない)。
     scaler = GradScaler(enabled=hps.train.fp16_run and not hps.train.bf16_run)
     logger.info("Start training.")
 
@@ -882,6 +859,10 @@ def run():
 
     if pbar is not None:
         pbar.close()
+    if getattr(train_loader, "_iterator", None) is not None:
+        train_loader._iterator._shutdown_workers()
+    if dist.is_initialized():
+        dist.destroy_process_group()
 
 
 def train_and_evaluate(
@@ -908,12 +889,8 @@ def train_and_evaluate(
     if writers is not None:
         writer, writer_eval = writers
 
-    # train_loader.batch_sampler.set_epoch(epoch)
     global global_step
 
-    # 混合精度モードの決定: bf6_run を優先し、次に fp16_run、両方 False なら fp32 (AMP無効)。
-    # T4 (Turing, sm_75) は bf16 の Tensor Core 演算に対応していないため、
-    # T4環境では config.json で fp16_run: true を指定することを推奨する。
     if hps.train.bf16_run:
         amp_dtype = torch.bfloat16
         amp_enabled = True
@@ -930,6 +907,24 @@ def train_and_evaluate(
         net_dur_disc.train()
     if net_wd is not None:
         net_wd.train()
+
+    net_g_params = tuple(p for p in net_g.parameters() if p.requires_grad)
+    net_d_params = tuple(p for p in net_d.parameters() if p.requires_grad)
+    net_wd_params = (
+        tuple(p for p in net_wd.parameters() if p.requires_grad)
+        if net_wd is not None
+        else ()
+    )
+    segment_frames = hps.train.segment_size // hps.data.hop_length
+    freeze_d_for_g = getattr(net_d, "_sbv2_freeze_for_generator", False)
+
+    optim_g.zero_grad(set_to_none=True)
+    optim_d.zero_grad(set_to_none=True)
+    if optim_dur_disc is not None:
+        optim_dur_disc.zero_grad(set_to_none=True)
+    if optim_wd is not None:
+        optim_wd.zero_grad(set_to_none=True)
+
     for batch_idx, (
         x,
         x_lengths,
@@ -943,8 +938,6 @@ def train_and_evaluate(
         bert,
         style_vec,
     ) in enumerate(train_loader):
-        # 勾配ノルムはログ用のみ。通常ステップでは計測しないことで、GPU 同期を
-        # 発生させない。rank 0 以外はこの値を出力しないため計測不要。
         log_this_step = (
             rank == 0
             and global_step % hps.train.log_interval == 0
@@ -956,15 +949,12 @@ def train_and_evaluate(
                 - net_g.module.noise_scale_delta * global_step
             )
             net_g.module.current_mas_noise_scale = max(current_mas_noise_scale, 0.0)
-        x, x_lengths = x.cuda(local_rank, non_blocking=True), x_lengths.cuda(
-            local_rank, non_blocking=True
-        )
-        spec, spec_lengths = spec.cuda(
-            local_rank, non_blocking=True
-        ), spec_lengths.cuda(local_rank, non_blocking=True)
-        y, y_lengths = y.cuda(local_rank, non_blocking=True), y_lengths.cuda(
-            local_rank, non_blocking=True
-        )
+        x = x.cuda(local_rank, non_blocking=True)
+        x_lengths = x_lengths.cuda(local_rank, non_blocking=True)
+        spec = spec.cuda(local_rank, non_blocking=True)
+        spec_lengths = spec_lengths.cuda(local_rank, non_blocking=True)
+        y = y.cuda(local_rank, non_blocking=True)
+        y_lengths = y_lengths.cuda(local_rank, non_blocking=True)
         speakers = speakers.cuda(local_rank, non_blocking=True)
         tone = tone.cuda(local_rank, non_blocking=True)
         language = language.cuda(local_rank, non_blocking=True)
@@ -980,7 +970,7 @@ def train_and_evaluate(
                 x_mask,
                 z_mask,
                 (z, z_p, m_p, logs_p, m_q, logs_q),
-                (hidden_x, logw, logw_),  # , logw_sdp),
+                (hidden_x, logw, logw_),
                 g,
             ) = net_g(
                 x,
@@ -993,12 +983,16 @@ def train_and_evaluate(
                 bert,
                 style_vec,
             )
-            segment_frames = hps.train.segment_size // hps.data.hop_length
+            del attn, m_q, z, x, x_lengths, spec_lengths, speakers, tone, language, bert, style_vec
+            if net_dur_disc is None:
+                del hidden_x, logw, logw_, g, x_mask
+
             mel_input = (
                 commons.slice_segments(spec, ids_slice, segment_frames)
                 if algorithm_optimizations
                 else spec
             )
+            del spec
             mel = spec_to_mel_torch(
                 mel_input,
                 hps.data.filter_length,
@@ -1007,11 +1001,13 @@ def train_and_evaluate(
                 hps.data.mel_fmin,
                 hps.data.mel_fmax,
             )
+            del mel_input
             y_mel = (
                 mel
                 if algorithm_optimizations
                 else commons.slice_segments(mel, ids_slice, segment_frames)
             )
+            del mel
             y_hat_mel = mel_spectrogram_torch(
                 y_hat.squeeze(1).float(),
                 hps.data.filter_length,
@@ -1021,22 +1017,25 @@ def train_and_evaluate(
                 hps.data.win_length,
                 hps.data.mel_fmin,
                 hps.data.mel_fmax,
-                # The decoder's final tanh guarantees this range. Avoid two
-                # host synchronizations checking an invariant of y_hat.
                 check_range=not algorithm_optimizations,
             )
 
             y = commons.slice_segments(
                 y, ids_slice * hps.data.hop_length, hps.train.segment_size
-            )  # slice
+            )
+            del ids_slice, y_lengths
 
             # Discriminator
-            y_d_hat_r, y_d_hat_g, _, _ = net_d(y, y_hat.detach())
+            y_d_hat_r, y_d_hat_g, _, _ = net_d(
+                y, y_hat.detach(), include_fmap=False
+            )
             with autocast(enabled=amp_enabled, dtype=amp_dtype):
                 loss_disc, losses_disc_r, losses_disc_g = discriminator_loss(
                     y_d_hat_r, y_d_hat_g
                 )
                 loss_disc_all = loss_disc
+            del y_d_hat_r, y_d_hat_g
+
             if net_dur_disc is not None:
                 y_dur_hat_r, y_dur_hat_g = net_dur_disc(
                     hidden_x.detach(),
@@ -1046,24 +1045,20 @@ def train_and_evaluate(
                     g.detach(),
                 )
                 with autocast(enabled=amp_enabled, dtype=amp_dtype):
-                    # TODO: I think need to mean using the mask, but for now, just mean all
                     (
                         loss_dur_disc,
                         losses_dur_disc_r,
                         losses_dur_disc_g,
                     ) = discriminator_loss(y_dur_hat_r, y_dur_hat_g)
                     loss_dur_disc_all = loss_dur_disc
-                optim_dur_disc.zero_grad()
+                del y_dur_hat_r, y_dur_hat_g
+                optim_dur_disc.zero_grad(set_to_none=True)
                 scaler.scale(loss_dur_disc_all).backward()
                 scaler.unscale_(optim_dur_disc)
-                # torch.nn.utils.clip_grad_norm_(
-                # parameters=net_dur_disc.parameters(), max_norm=5
-                # )
                 scaler.step(optim_dur_disc)
+                optim_dur_disc.zero_grad(set_to_none=True)
             wavlm_real_embeddings = None
             if net_wd is not None:
-                # logger.debug(f"y.shape: {y.shape}, y_hat.shape: {y_hat.shape}")
-                # shape: (batch, 1, time)
                 with autocast(enabled=amp_enabled, dtype=amp_dtype):
                     if (
                         algorithm_optimizations
@@ -1080,41 +1075,39 @@ def train_and_evaluate(
                             y.detach().squeeze(1), y_hat.detach().squeeze(1)
                         ).mean()
 
-                optim_wd.zero_grad()
+                optim_wd.zero_grad(set_to_none=True)
                 scaler.scale(loss_slm).backward()
                 scaler.unscale_(optim_wd)
-                # torch.nn.utils.clip_grad_norm_(parameters=net_wd.parameters(), max_norm=200)
                 if log_this_step:
                     grad_norm_wd = commons.clip_grad_value_(
-                        net_wd.parameters(), None
+                        net_wd_params, None
                     )
                 scaler.step(optim_wd)
+                optim_wd.zero_grad(set_to_none=True)
 
-        optim_d.zero_grad()
+        optim_d.zero_grad(set_to_none=True)
         scaler.scale(loss_disc_all).backward()
         scaler.unscale_(optim_d)
         if amp_enabled:
-            # fp16/bf16 いずれの混合精度時も、Discriminatorの勾配爆発対策として norm clipping を適用する。
-            # 特にfp16はbf16よりダイナミックレンジが狭くNaN化しやすいため、この安全策の意味が大きい。
-            torch.nn.utils.clip_grad_norm_(parameters=net_d.parameters(), max_norm=200)
+            torch.nn.utils.clip_grad_norm_(parameters=net_d_params, max_norm=200)
         if log_this_step:
-            grad_norm_d = commons.clip_grad_value_(net_d.parameters(), None)
+            grad_norm_d = commons.clip_grad_value_(net_d_params, None)
         scaler.step(optim_d)
+        optim_d.zero_grad(set_to_none=True)
 
         with generator_discriminator_pass(
-            net_d, enabled=net_d._sbv2_freeze_for_generator,
+            net_d, enabled=freeze_d_for_g,
             use_spectral_norm=hps.model.use_spectral_norm,
             duration_discriminator=net_dur_disc, wavlm_discriminator=net_wd,
         ) as g_discriminator:
             with autocast(enabled=amp_enabled, dtype=amp_dtype):
                 # Generator
                 y_d_hat_r, y_d_hat_g, fmap_r, fmap_g = g_discriminator(y, y_hat)
+                del y_d_hat_r
                 if net_dur_disc is not None:
                     _, y_dur_hat_g = net_dur_disc(hidden_x, x_mask, logw_, logw, g)
+                    del hidden_x, x_mask, logw_, logw, g
                 if net_wd is not None:
-                    # The existing objective includes these losses only when
-                    # the duration discriminator is enabled. Otherwise they
-                    # are diagnostics and are needed only on logging steps.
                     if algorithm_optimizations:
                         if net_dur_disc is not None:
                             loss_lm, loss_lm_gen = wl.generator_losses(
@@ -1132,44 +1125,43 @@ def train_and_evaluate(
                     else:
                         loss_lm = wl(y.detach().squeeze(1), y_hat.squeeze(1)).mean()
                         loss_lm_gen = wl.generator(y_hat.squeeze(1))
+                    del wavlm_real_embeddings
+                del y, y_hat
                 with autocast(enabled=amp_enabled, dtype=amp_dtype):
                     loss_dur = torch.sum(l_length.float())
+                    del l_length
                     loss_mel = F.l1_loss(y_mel, y_hat_mel) * hps.train.c_mel
+                    del y_mel, y_hat_mel
                     loss_kl = kl_loss(z_p, logs_q, m_p, logs_p, z_mask) * hps.train.c_kl
+                    del z_p, logs_q, m_p, logs_p, z_mask
 
                     loss_fm = feature_loss(fmap_r, fmap_g)
+                    del fmap_r, fmap_g
                     loss_gen, losses_gen = generator_loss(y_d_hat_g)
-                    # loss_commit = loss_commit * hps.train.c_commit
+                    del y_d_hat_g
 
                     loss_gen_all = loss_gen + loss_fm + loss_mel + loss_dur + loss_kl
                     if net_dur_disc is not None:
                         loss_dur_gen, losses_dur_gen = generator_loss(y_dur_hat_g)
+                        del y_dur_hat_g
                         if net_wd is not None:
                             loss_gen_all += loss_dur_gen + loss_lm + loss_lm_gen
                         else:
                             loss_gen_all += loss_dur_gen
-            optim_g.zero_grad()
+            optim_g.zero_grad(set_to_none=True)
             scaler.scale(loss_gen_all).backward()
             scaler.unscale_(optim_g)
             if amp_enabled:
-                # Discriminator側と同様、fp16/bf16 いずれの混合精度時も
-                # Generatorの勾配爆発対策として norm clipping を適用する(fp32時は元の挙動通り適用しない)。
-                torch.nn.utils.clip_grad_norm_(parameters=net_g.parameters(), max_norm=500)
+                torch.nn.utils.clip_grad_norm_(parameters=net_g_params, max_norm=500)
             if log_this_step:
-                grad_norm_g = commons.clip_grad_value_(net_g.parameters(), None)
+                grad_norm_g = commons.clip_grad_value_(net_g_params, None)
             scaler.step(optim_g)
+            optim_g.zero_grad(set_to_none=True)
         scaler.update()
 
         if rank == 0:
             if log_this_step:
                 lr = optim_g.param_groups[0]["lr"]
-                losses = [loss_disc, loss_gen, loss_fm, loss_mel, loss_dur, loss_kl]
-                # logger.info(
-                #     "Train Epoch: {} [{:.0f}%]".format(
-                #         epoch, 100.0 * batch_idx / len(train_loader)
-                #     )
-                # )
-                # logger.info([x.item() for x in losses] + [global_step, lr])
 
                 scalar_dict = {
                     "loss/g/total": loss_gen_all,
@@ -1224,25 +1216,9 @@ def train_and_evaluate(
                             "loss/g/lm_gen": loss_lm_gen,
                         }
                     )
-                # 以降のログは計算が重い気がするし誰も見てない気がするのでコメントアウト
-                # image_dict = {
-                #     "slice/mel_org": utils.plot_spectrogram_to_numpy(
-                #         y_mel[0].data.cpu().numpy()
-                #     ),
-                #     "slice/mel_gen": utils.plot_spectrogram_to_numpy(
-                #         y_hat_mel[0].data.cpu().numpy()
-                #     ),
-                #     "all/mel": utils.plot_spectrogram_to_numpy(
-                #         mel[0].data.cpu().numpy()
-                #     ),
-                #     "all/attn": utils.plot_alignment_to_numpy(
-                #         attn[0, 0].data.cpu().numpy()
-                #     ),
-                # }
                 utils.summarize(
                     writer=writer,
                     global_step=global_step,
-                    # images=image_dict,
                     scalars=scalar_dict,
                 )
 
@@ -1290,7 +1266,6 @@ def train_and_evaluate(
                         n_ckpts_to_keep=keep_ckpts,
                         sort_by_time=True,
                     )
-                # Save safetensors (for inference) to `model_assets/{model_name}`
                 utils.safetensors.save_safetensors(
                     net_g,
                     epoch,
@@ -1316,6 +1291,9 @@ def train_and_evaluate(
                         run_as_future=True,
                     )
 
+        del loss_gen_all, loss_disc_all, loss_disc, loss_gen, loss_fm, loss_mel, loss_dur, loss_kl
+        del losses_gen, losses_disc_r, losses_disc_g
+
         global_step += 1
         if pbar is not None:
             pbar.set_description(
@@ -1323,8 +1301,6 @@ def train_and_evaluate(
             )
             pbar.update()
 
-    gc.collect()
-    torch.cuda.empty_cache()
     if pbar is None and rank == 0:
         logger.info(f"====> Epoch: {epoch}, step: {global_step}")
 
@@ -1371,39 +1347,6 @@ def evaluate(hps, generator, eval_loader, writer_eval):
                     sdp_ratio=0.0 if not use_sdp else 1.0,
                 )
                 y_hat_lengths = mask.sum([1, 2]).long() * hps.data.hop_length
-                # 以降のログは計算が重い気がするし誰も見てない気がするのでコメントアウト
-                # mel = spec_to_mel_torch(
-                #     spec,
-                #     hps.data.filter_length,
-                #     hps.data.n_mel_channels,
-                #     hps.data.sampling_rate,
-                #     hps.data.mel_fmin,
-                #     hps.data.mel_fmax,
-                # )
-                # y_hat_mel = mel_spectrogram_torch(
-                #     y_hat.squeeze(1).float(),
-                #     hps.data.filter_length,
-                #     hps.data.n_mel_channels,
-                #     hps.data.sampling_rate,
-                #     hps.data.hop_length,
-                #     hps.data.win_length,
-                #     hps.data.mel_fmin,
-                #     hps.data.mel_fmax,
-                # )
-                # image_dict.update(
-                #     {
-                #         f"gen/mel_{batch_idx}": utils.plot_spectrogram_to_numpy(
-                #             y_hat_mel[0].cpu().numpy()
-                #         )
-                #     }
-                # )
-                # image_dict.update(
-                #     {
-                #         f"gt/mel_{batch_idx}": utils.plot_spectrogram_to_numpy(
-                #             mel[0].cpu().numpy()
-                #         )
-                #     }
-                # )
                 audio_dict.update(
                     {
                         f"gen/audio_{batch_idx}_{use_sdp}": y_hat[

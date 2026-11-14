@@ -3,49 +3,187 @@
 コードと完全に一致している保証はない。あくまで参考程度とすること。
 """
 
-from typing import Any
+from typing import Any, Optional
 
 import numba
 import torch
 from numpy import float32, int32, zeros
 
+try:
+    import triton
+    import triton.language as tl
 
-def maximum_path(neg_cent: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-    """
-    与えられた負の中心とマスクを使用して最大パスを計算する
+    _TRITON_AVAILABLE = True
+except ImportError:
+    _TRITON_AVAILABLE = False
 
-    Args:
-        neg_cent (torch.Tensor): 負の中心を表すテンソル
-        mask (torch.Tensor): マスクを表すテンソル
+try:
+    from super_monotonic_align import maximum_path as _sma_maximum_path
 
-    Returns:
-        Tensor: 計算された最大パスを表すテンソル
-    """
+    _SMA_AVAILABLE = True
+except ImportError:
+    _SMA_AVAILABLE = False
 
+
+if _TRITON_AVAILABLE:
+
+    @triton.jit
+    def _maximum_path_triton_kernel(
+        path_ptr,
+        neg_cent_ptr,
+        mask_ptr,
+        val_ptr,
+        stride_pb,
+        stride_py,
+        stride_px,
+        stride_nb,
+        stride_ny,
+        stride_nx,
+        stride_mb,
+        stride_my,
+        stride_mx,
+        stride_vb,
+        stride_vy,
+        T_y: int,
+        T_x: int,
+        BLOCK_X: tl.constexpr,
+    ):
+        b = tl.program_id(0)
+        offs_x = tl.arange(0, BLOCK_X)
+
+        m_x = tl.load(
+            mask_ptr + b * stride_mb + offs_x * stride_mx,
+            mask=offs_x < T_x,
+            other=0,
+        )
+        t_x = tl.sum((m_x != 0).to(tl.int32), axis=0)
+
+        t_y = 0
+        for y0 in range(0, T_y, BLOCK_X):
+            oy = y0 + offs_x
+            m_y = tl.load(
+                mask_ptr + b * stride_mb + oy * stride_my,
+                mask=oy < T_y,
+                other=0,
+            )
+            t_y += tl.sum((m_y != 0).to(tl.int32), axis=0)
+
+        max_neg_val = -1e9
+        n_base = neg_cent_ptr + b * stride_nb
+        v_base = val_ptr + b * stride_vb
+
+        for y in range(t_y):
+            x_lo = tl.maximum(0, t_x + y - t_y)
+            x_hi = tl.minimum(t_x, y + 1)
+            active = (offs_x >= x_lo) & (offs_x < x_hi)
+
+            nc = tl.load(
+                n_base + y * stride_ny + offs_x * stride_nx,
+                mask=active,
+                other=0.0,
+            ).to(tl.float32)
+
+            v_cur = tl.load(
+                v_base + (y - 1) * stride_vy + offs_x,
+                mask=active & (y > 0) & (offs_x != y),
+                other=max_neg_val,
+            )
+            v_prev_loaded = tl.load(
+                v_base + (y - 1) * stride_vy + (offs_x - 1),
+                mask=active & (y > 0) & (offs_x > 0),
+                other=max_neg_val,
+            )
+            v_prev = tl.where((y == 0) & (offs_x == 0), 0.0, v_prev_loaded)
+
+            val = nc + tl.maximum(v_prev, v_cur)
+            tl.store(
+                v_base + y * stride_vy + offs_x,
+                val,
+                mask=active,
+            )
+            tl.debug_barrier()
+
+        p_base = path_ptr + b * stride_pb
+        index = t_x - 1
+        for y_rev in range(t_y):
+            y = t_y - 1 - y_rev
+            tl.store(p_base + y * stride_py + index * stride_px, 1, mask=t_x > 0)
+            can_step = (y > 0) & (index != 0)
+            v_c = tl.load(
+                v_base + (y - 1) * stride_vy + index,
+                mask=can_step,
+                other=0.0,
+            )
+            v_p = tl.load(
+                v_base + (y - 1) * stride_vy + (index - 1),
+                mask=can_step,
+                other=0.0,
+            )
+            step = can_step & ((index == y) | (v_c < v_p))
+            index = tl.where(step, index - 1, index)
+
+
+def _maximum_path_triton(neg_cent: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    B, T_y, T_x = neg_cent.shape
+    path = torch.zeros((B, T_y, T_x), dtype=neg_cent.dtype, device=neg_cent.device)
+    if B == 0 or T_y == 0 or T_x == 0:
+        return path
+    val_buf = torch.empty((B, T_y, T_x), dtype=torch.float32, device=neg_cent.device)
+    block_x = max(128, triton.next_power_of_2(T_x))
+    _maximum_path_triton_kernel[(B,)](
+        path,
+        neg_cent,
+        mask,
+        val_buf,
+        path.stride(0),
+        path.stride(1),
+        path.stride(2),
+        neg_cent.stride(0),
+        neg_cent.stride(1),
+        neg_cent.stride(2),
+        mask.stride(0),
+        mask.stride(1),
+        mask.stride(2),
+        val_buf.stride(0),
+        val_buf.stride(1),
+        T_y=T_y,
+        T_x=T_x,
+        BLOCK_X=block_x,
+        num_warps=1,
+    )
+    return path
+
+
+def _maximum_path_numba(neg_cent: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
     device = neg_cent.device
     dtype = neg_cent.dtype
-    neg_cent = neg_cent.data.cpu().numpy().astype(float32)
-    path = zeros(neg_cent.shape, dtype=int32)
+    neg_cent_np = neg_cent.data.cpu().numpy().astype(float32)
+    path = zeros(neg_cent_np.shape, dtype=int32)
 
     t_t_max = mask.sum(1)[:, 0].data.cpu().numpy().astype(int32)
     t_s_max = mask.sum(2)[:, 0].data.cpu().numpy().astype(int32)
-    __maximum_path_jit(path, neg_cent, t_t_max, t_s_max)
+    __maximum_path_jit(path, neg_cent_np, t_t_max, t_s_max)
 
     return torch.from_numpy(path).to(device=device, dtype=dtype)
 
 
-from super_monotonic_align import maximum_path as _sma_maximum_path
 def maximum_path(neg_cent: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
     """
     sbv2/VITS 側: neg_cent, mask は [B, T_mel, T_text]
-    super-monotonic-align 側: [B, T_text, T_mel] (Glow-TTS 由来) を要求するため
-    dim1/dim2 を入れ替えてから渡し、結果をまた入れ替えて戻す。
+    GPU 上では転置コピー不要の単一 Triton カーネルを優先使用し、
+    利用不可の場合は super-monotonic-align または Numba JIT にフォールバックする。
     """
-    dtype = neg_cent.dtype
-    neg_cent_t = neg_cent.transpose(1, 2).float()   # [B, T_text, T_mel], fp32
-    mask_t = mask.transpose(1, 2).to(torch.int32)   # [B, T_text, T_mel]
-    path_t = _sma_maximum_path(neg_cent_t, mask_t, dtype=torch.float32)
-    return path_t.transpose(1, 2).to(dtype)          # [B, T_mel, T_text] に戻す
+    if neg_cent.is_cuda:
+        if _TRITON_AVAILABLE and neg_cent.size(2) <= 2048 and neg_cent.size(1) <= 8192:
+            return _maximum_path_triton(neg_cent, mask)
+        if _SMA_AVAILABLE:
+            dtype = neg_cent.dtype
+            neg_cent_t = neg_cent.transpose(1, 2).float()
+            mask_t = mask.transpose(1, 2).to(torch.int32)
+            path_t = _sma_maximum_path(neg_cent_t, mask_t, dtype=torch.float32)
+            return path_t.transpose(1, 2).to(dtype)
+    return _maximum_path_numba(neg_cent, mask)
+
 
 @numba.jit(
     numba.void(
@@ -60,14 +198,7 @@ def maximum_path(neg_cent: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
 def __maximum_path_jit(paths: Any, values: Any, t_ys: Any, t_xs: Any) -> None:
     """
     与えられたパス、値、およびターゲットの y と x 座標を使用して JIT で最大パスを計算する
-
-    Args:
-        paths: 計算されたパスを格納するための整数型の 3 次元配列
-        values: 値を格納するための浮動小数点型の 3 次元配列
-        t_ys: ターゲットの y 座標を格納するための整数型の 1 次元配列
-        t_xs: ターゲットの x 座標を格納するための整数型の 1 次元配列
     """
-
     b = paths.shape[0]
     max_neg_val = -1e9
     for i in range(int(b)):

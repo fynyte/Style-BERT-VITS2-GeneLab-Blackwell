@@ -3,15 +3,41 @@ import torchaudio
 from transformers import AutoModel
 
 
-def feature_loss(fmap_r, fmap_g):
-    loss = 0
-    for dr, dg in zip(fmap_r, fmap_g):
-        for rl, gl in zip(dr, dg):
-            rl = rl.float().detach()
-            gl = gl.float()
-            loss += torch.mean(torch.abs(rl - gl))
+class _FeatureLoss(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, fmap_r_flat, *fmap_g_flat):
+        ctx.save_for_backward(*fmap_r_flat, *fmap_g_flat)
+        ctx.num_maps = len(fmap_g_flat)
+        loss = 0
+        for rl, gl in zip(fmap_r_flat, fmap_g_flat):
+            loss += torch.mean(torch.abs(rl.float() - gl.float()))
+        return loss * 2
 
-    return loss * 2
+    @staticmethod
+    def backward(ctx, grad_output):
+        saved = ctx.saved_tensors
+        n = ctx.num_maps
+        fmap_r_flat = saved[:n]
+        fmap_g_flat = saved[n:]
+        grad_base = grad_output.float() * 2
+        grads = [None]
+        for rl, gl in zip(fmap_r_flat, fmap_g_flat):
+            if gl.requires_grad:
+                scale = grad_base / gl.numel()
+                grads.append(
+                    (torch.sgn(gl.float() - rl.float()) * scale).to(gl.dtype)
+                )
+            else:
+                grads.append(None)
+        return tuple(grads)
+
+
+def feature_loss(fmap_r, fmap_g):
+    fmap_r_flat = [rl.detach() for dr in fmap_r for rl in dr]
+    fmap_g_flat = [gl for dg in fmap_g for gl in dg]
+    if not fmap_g_flat:
+        return 0
+    return _FeatureLoss.apply(fmap_r_flat, *fmap_g_flat)
 
 
 def discriminator_loss(disc_real_outputs, disc_generated_outputs):
@@ -19,11 +45,6 @@ def discriminator_loss(disc_real_outputs, disc_generated_outputs):
     r_losses, g_losses はログ記録 (TensorBoard) 専用に使われる値であり、
     通常ステップ (log_this_step=False) では捨てられる。
     そのため、ここでは常に .item() を呼ばずテンソルのまま返す。
-    .item() は GPU->CPU 同期を強制するため、これを毎ステップ呼ぶと
-    ログを取らないステップでも無駄な同期コストを払うことになり、
-    特に1ステップの計算時間が短い/同期レイテンシに敏感な環境
-    (例: 一部のクラウド上のH100/B200/B300など) で顕著なオーバーヘッドになりうる。
-    値が実際に必要な呼び出し側 (ログ記録時のみ) で .item() すること。
     """
     loss = 0
     r_losses = []
@@ -34,8 +55,8 @@ def discriminator_loss(disc_real_outputs, disc_generated_outputs):
         r_loss = torch.mean((1 - dr) ** 2)
         g_loss = torch.mean(dg**2)
         loss += r_loss + g_loss
-        r_losses.append(r_loss)  # .item() を呼ばずテンソルのまま格納
-        g_losses.append(g_loss)  # .item() を呼ばずテンソルのまま格納
+        r_losses.append(r_loss.detach())
+        g_losses.append(g_loss.detach())
 
     return loss, r_losses, g_losses
 
@@ -46,7 +67,7 @@ def generator_loss(disc_outputs):
     for dg in disc_outputs:
         dg = dg.float()
         l = torch.mean((1 - dg) ** 2)
-        gen_losses.append(l)
+        gen_losses.append(l.detach())
         loss += l
 
     return loss, gen_losses
